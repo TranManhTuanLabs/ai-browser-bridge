@@ -49,4 +49,53 @@ describe("browser status", () => {
     expect(status.state).toBe("chrome-not-running");
     expect(status.canAttach).toBe(false);
   });
+
+  it("reports my-edge ready from DevToolsActivePort without touching /json", async () => {
+    const status = await readBrowserStatus(
+      { browserChoice: "my-edge" },
+      {
+        isBrowserProcessRunning: async () => true,
+        ownBrowserDebugTarget: () => ({
+          port: 9222,
+          endpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        }),
+      },
+    );
+
+    expect(status.state).toBe("ready");
+    expect(status.canAttach).toBe(true);
+    expect(status.browserChoice).toBe("my-edge");
+    expect(status.browserLabel).toBe("Microsoft Edge");
+    expect(status.inspectUrl).toBe("edge://inspect/#remote-debugging");
+    expect(status.allowRequired).toBe(true);
+    expect(status.endpoint).toBe("ws://127.0.0.1:9222/devtools/browser/abc");
+    expect(status.message).toContain("Click Allow");
+  });
+
+  it("reports my-edge running without debugging when the active-port file is missing", async () => {
+    const status = await readBrowserStatus(
+      { browserChoice: "my-edge" },
+      {
+        isBrowserProcessRunning: async () => true,
+        ownBrowserDebugTarget: () => undefined,
+      },
+    );
+
+    expect(status.state).toBe("chrome-running-without-debug");
+    expect(status.canAttach).toBe(false);
+    expect(status.message).toContain("edge://inspect/#remote-debugging");
+  });
+
+  it("reports my-edge not running when Edge is closed", async () => {
+    const status = await readBrowserStatus(
+      { browserChoice: "my-edge" },
+      {
+        isBrowserProcessRunning: async () => false,
+        ownBrowserDebugTarget: () => undefined,
+      },
+    );
+
+    expect(status.state).toBe("chrome-not-running");
+    expect(status.canAttach).toBe(false);
+  });
 });

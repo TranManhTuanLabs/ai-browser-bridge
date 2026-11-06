@@ -7,9 +7,21 @@ import { chromium } from "playwright";
 import type { BridgeProviderId } from "@/config";
 import type { Conversation } from "@/features/domain";
 import { type BrowserProvider, providerFor, providerIdForUrl } from "@/features/providers";
-import { bridgeChromeProfileRoot, chromeAppName } from "./browserProfile.ts";
+import {
+  bridgeChromeProfileRoot,
+  browserLabelForChoice,
+  chromeAppName,
+  configuredBrowserChoice,
+  dataRootForChoice,
+  inspectUrlForChoice,
+  ownBrowserDebugTarget,
+} from "./browserProfile.ts";
+import type { BrowserChoice } from "./browserSchemas.ts";
 
 export const BRIDGE_DEBUG_PORT = 9222;
+// Your own Chrome/Edge asks you to click Allow on every new connection, so a
+// connect waits that long for the click. It cannot be automated away.
+const OWN_BROWSER_ALLOW_TIMEOUT_MS = 60_000;
 
 // Matches a Chrome command line arg like --user-data-dir=/Users/me/Profile.
 const USER_DATA_DIR_ARG = /--user-data-dir=(?<userDataDir>[^\s]+)/;
@@ -113,10 +125,10 @@ export const isDebugPortListening = async (
 export const isChromeProcessRunning = (
   input: { readonly appName?: string } = {},
 ): Promise<boolean> => {
-  let appName = chromeAppName();
-  if (input.appName !== undefined) {
-    appName = input.appName;
-  }
+  return isBrowserProcessRunning(input.appName ?? chromeAppName());
+};
+
+export const isBrowserProcessRunning = (appName: string): Promise<boolean> => {
   return new Promise((resolveRunning) => {
     execFile("pgrep", ["-f", `${appName}.app/Contents/MacOS`], (error, stdout) => {
       resolveRunning(error === null && stdout.trim().length > 0);
@@ -140,6 +152,7 @@ const waitForDebugPort = async (port: number, maxWaitMs = 30_000): Promise<void>
 type BrowserSessionOptions = {
   readonly debugPort?: number;
   readonly profileRoot?: string;
+  readonly browserChoice?: BrowserChoice;
 };
 
 // Chrome argv for a bridge debug profile. Final positional arg is the launch URL.
@@ -205,6 +218,54 @@ const markCdpDisconnectOnly = (browser: Browser): void => {
 
 const spawnReadyError = (port: number): BrowserAttachError => {
   return new BrowserAttachError(`Chrome started but debug port ${port} did not become ready.`);
+};
+
+const ownBrowserOffError = (choice: BrowserChoice): BrowserAttachError => {
+  const inspectUrl = inspectUrlForChoice(choice) ?? "";
+  return new BrowserAttachError(
+    `Remote debugging is off in your ${browserLabelForChoice(choice)}. Turn it on at ${inspectUrl}, then run the command again and click Allow.`,
+  );
+};
+
+const ownBrowserConnectError = (choice: BrowserChoice, cause: unknown): BrowserAttachError => {
+  const inspectUrl = inspectUrlForChoice(choice) ?? "";
+  return new BrowserAttachError(
+    `Could not connect to your ${browserLabelForChoice(choice)}. Click Allow when it asks, and keep remote debugging on at ${inspectUrl}. (${String(cause)})`,
+  );
+};
+
+const connectOverOwnBrowserEndpoint = async (
+  choice: BrowserChoice,
+  endpoint: string,
+): Promise<Browser> => {
+  try {
+    return await chromium.connectOverCDP(endpoint, { timeout: OWN_BROWSER_ALLOW_TIMEOUT_MS });
+  } catch (error) {
+    throw ownBrowserConnectError(choice, error);
+  }
+};
+
+type OwnBrowserState = { browser: Browser; context: BrowserContext; page: Page };
+
+// Always a new tab: the bridge never types into a tab you opened yourself.
+// One WebSocket serves the whole session; a reconnect is a new connection
+// and asks for Allow again.
+const connectOwnBrowser = async (
+  choice: BrowserChoice,
+  endpoint: string,
+): Promise<OwnBrowserState> => {
+  const browser = await connectOverOwnBrowserEndpoint(choice, endpoint);
+  markCdpDisconnectOnly(browser);
+  const [defaultContext] = browser.contexts();
+  if (!defaultContext) {
+    await Promise.allSettled([browser.close()]);
+    throw new BrowserAttachError(
+      `Your ${browserLabelForChoice(choice)} has no profile window the bridge can open a tab in.`,
+    );
+  }
+  const page = await defaultContext.newPage();
+  console.error(`  Connected to your ${browserLabelForChoice(choice)}, opened a bridge tab.`);
+  return { browser, context: defaultContext, page };
 };
 
 type CdpConnectState = {
@@ -378,12 +439,19 @@ export class BrowserSession {
   private readonly provider: BrowserProvider;
   private readonly debugPort: number;
   private readonly profileRoot: string;
+  private readonly browserChoice: BrowserChoice;
+  private ownsPage = false;
   readonly attachedViaCdp = { value: false };
   readonly spawnedNew = { value: false };
 
   constructor(providerId: BridgeProviderId = "chatgpt", options: BrowserSessionOptions = {}) {
     this.providerId = providerId;
     this.provider = providerFor(providerId);
+    if (options.browserChoice === undefined) {
+      this.browserChoice = configuredBrowserChoice();
+    } else {
+      this.browserChoice = options.browserChoice;
+    }
     if (options.debugPort === undefined) {
       this.debugPort = BRIDGE_DEBUG_PORT;
     } else {
@@ -396,12 +464,17 @@ export class BrowserSession {
     }
   }
 
+  getBrowserChoice(): BrowserChoice {
+    return this.browserChoice;
+  }
+
   private cdpUrl(): string {
     return cdpUrlForPort(this.debugPort);
   }
 
   async launch(): Promise<Page> {
     await this.resetSession();
+    if (this.browserChoice !== "bridge-profile") return await this.attachOwnBrowser();
     if (await this.connectExisting()) return this.markAttached();
     return await this.continueLaunch();
   }
@@ -411,8 +484,17 @@ export class BrowserSession {
     readonly intervalMs?: number;
   }): Promise<Page> {
     await this.resetSession();
+    if (this.browserChoice !== "bridge-profile") return await this.attachOwnBrowser();
     if (await this.connectExisting(options)) return this.markAttached();
     throw attachOnlyError(this.debugPort);
+  }
+
+  // Reconnect on demand: re-read DevToolsActivePort fresh on every call, so a
+  // browser restart or a new Allow click is picked up without a poll loop.
+  // Callers keep their own tab's provider context; the bridge never switches
+  // provider for the user when one hits its free limit.
+  async reconnect(): Promise<Page> {
+    return await this.launch();
   }
 
   // Fan-out primitive: each parallel Conversation gets its own page in the one
@@ -430,7 +512,16 @@ export class BrowserSession {
     return this.page;
   }
 
+  // Your own browser keeps running; only the tab the bridge opened goes away.
+  async closeOwnTab(): Promise<void> {
+    const page = this.page;
+    if (!this.ownsPage || !page) return;
+    this.ownsPage = false;
+    await Promise.allSettled([page.close()]);
+  }
+
   async close(): Promise<void> {
+    await this.closeOwnTab();
     const browser = this.browser;
     this.page = null;
     this.context = null;
@@ -453,6 +544,15 @@ export class BrowserSession {
   private markAttached(): Page {
     this.attachedViaCdp.value = true;
     return this.getPage();
+  }
+
+  private async attachOwnBrowser(): Promise<Page> {
+    const debugTarget = ownBrowserDebugTarget(dataRootForChoice(this.browserChoice));
+    if (debugTarget === undefined) throw ownBrowserOffError(this.browserChoice);
+    const state = await connectOwnBrowser(this.browserChoice, debugTarget.endpoint);
+    this.ownsPage = true;
+    this.finalizeCdpConnection(state);
+    return this.markAttached();
   }
 
   private async continueLaunch(): Promise<Page> {

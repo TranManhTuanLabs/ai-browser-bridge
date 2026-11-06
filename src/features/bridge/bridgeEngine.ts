@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { DEFAULT_MCP_PORT, DEFAULT_PERMISSION_MODE } from "@/config";
-import { BrowserSession } from "@/features/browser";
+import { type BrowserChoice, BrowserSession } from "@/features/browser";
 import type { BridgeConfig, Message } from "@/features/domain";
 import { normalizePermissionMode, type PermissionMode } from "@/features/domain";
 import { providerFor, providerIdFrom } from "@/features/providers";
@@ -31,7 +31,7 @@ import { ContextCounter } from "./contextCounter.ts";
 import { loadConfig, saveConfig } from "./loadConfig.ts";
 import { Orchestrator } from "./orchestrator.ts";
 
-export const mcpConnectorUrl = (tunnelUrl: string): string => {
+const mcpConnectorUrl = (tunnelUrl: string): string => {
   return `${tunnelUrl.replace(/\/+$/, "")}/mcp`;
 };
 
@@ -385,11 +385,13 @@ const connectBrowser = async (input: {
   log: (line: string) => void;
   debugPort?: number;
   profileRoot?: string;
+  browserChoice?: BrowserChoice;
 }): Promise<BrowserSession | null> => {
   const providerId = providerIdFrom(input.config.provider);
   let browser: BrowserSession | null = new BrowserSession(providerId, {
     debugPort: input.debugPort,
     profileRoot: input.profileRoot,
+    browserChoice: input.browserChoice,
   });
   try {
     const provider = providerFor(providerId);
@@ -461,6 +463,7 @@ const bootEngine = async (options: StartEngineOptions): Promise<EngineAssembly> 
       log: boot.log,
       debugPort: options.debugPort,
       profileRoot: options.profileRoot,
+      browserChoice: options.browserChoice,
     });
   }
   return {

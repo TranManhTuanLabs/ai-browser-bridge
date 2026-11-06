@@ -15,12 +15,21 @@ import type { BrowserProvider, CaptureMessagesOptions } from "../browserProvider
 import { GuestSessionError } from "../providerErrors.ts";
 import { stallReloadWatchdogFor } from "../renderStallWatchdog.ts";
 import { isResponseGenerating, waitForResponseIdle } from "../streamingGuard.ts";
+import {
+  attachmentsFromImageRefs,
+  fileIdFromChatGptFileUrl,
+  isChatGptFileUrl,
+  listConversationImageRefs,
+  readChatGptFileDownloadUrl,
+  readConversationReply,
+} from "./chatgptConversationImages.ts";
 import { searchChatGptConversations } from "./chatgptConversationSearch.ts";
 import {
   chatGptConversationIdFromUrl,
   chatGptConversationUrlFromIdOrUrl,
   isSameChatGptConversation,
 } from "./chatgptConversationUrl.ts";
+import { readLooseConversations } from "./chatgptLooseConversations.ts";
 
 const EDIT_BUTTON_SELECTORS = [
   'button[data-testid="edit-turn-button"]',
@@ -54,8 +63,23 @@ const MARKER_SUFFIX = "\u0000";
 
 const CONVERSATION_TURN_SELECTOR = '[data-testid^="conversation-turn-"], [data-turn-key]';
 
+// A multi-image reply shows one large preview plus a thumbnail strip holding every image once.
+const GENERATED_IMAGE_STRIP_SELECTOR = '[role="group"][aria-label="Generated images"] img';
+
+const GENERATED_IMAGE_SELECTOR =
+  'img[src*="/backend-api/estuary/content"], img[alt^="Generated image" i]';
+
+export const LIST_GENERATED_IMAGES_SOURCE = `
+const listGeneratedImagesIn = (scope) => {
+  const stripImages = Array.from(scope.querySelectorAll(${JSON.stringify(GENERATED_IMAGE_STRIP_SELECTOR)}));
+  const hasStripImages = stripImages.length > 0;
+  if (hasStripImages) return stripImages;
+  return Array.from(scope.querySelectorAll(${JSON.stringify(GENERATED_IMAGE_SELECTOR)}));
+};
+`;
+
 const DOM_SNAPSHOT_HELPERS_SOURCE = `
-const GENERATED_IMAGE_SELECTOR = 'img[src*="/backend-api/estuary/content"], img[alt^="Generated image"]';
+${LIST_GENERATED_IMAGES_SOURCE}
 
 const TURN_SELECTOR = '[data-testid^="conversation-turn-"]';
 
@@ -71,7 +95,7 @@ const conversationTurns = () => {
   for (const keyed of Array.from(document.querySelectorAll("[data-turn-key]"))) {
     const units = Array.from(keyed.querySelectorAll(UNIT_SELECTOR));
     turns.push(...units);
-    if (!hasAssistantUnit(units) && keyed.querySelector(GENERATED_IMAGE_SELECTOR)) turns.push(keyed);
+    if (!hasAssistantUnit(units) && listGeneratedImagesIn(keyed).length > 0) turns.push(keyed);
   }
   return turns;
 };
@@ -123,7 +147,7 @@ const serializeMessage = (element, role, messageIndex) => {
 // as extra children so the walker still visits them.
 const serializeTurn = (turn, messageIndex) => {
   const roleBlock = turnRoleBlock(turn);
-  const generatedImages = Array.from(imageScope(turn).querySelectorAll(GENERATED_IMAGE_SELECTOR));
+  const generatedImages = listGeneratedImagesIn(imageScope(turn));
   if (!roleBlock) {
     if (generatedImages.length === 0) return null;
     let text = "";
@@ -150,7 +174,7 @@ const serializeTurn = (turn, messageIndex) => {
 const turnRole = (turn) => {
   const roleBlock = turnRoleBlock(turn);
   if (roleBlock) return roleBlock.role;
-  if (turn.querySelector(GENERATED_IMAGE_SELECTOR)) return "assistant";
+  if (listGeneratedImagesIn(turn).length > 0) return "assistant";
   return null;
 };
 
@@ -209,7 +233,7 @@ const LAST_ASSISTANT_TURN_STATE_SOURCE = String.raw`
   if (!lastAssistantTurn) {
     return { text: "", assetCount: 0, loadedAssetCount: 0, pendingAssetCount: 0, expectedImageMarkerCount: 0 };
   }
-  const images = Array.from(imageScope(lastAssistantTurn).querySelectorAll(GENERATED_IMAGE_SELECTOR));
+  const images = listGeneratedImagesIn(imageScope(lastAssistantTurn));
   let loadedAssetCount = 0;
   let pendingAssetCount = 0;
   for (const node of images) {
@@ -350,7 +374,7 @@ export const SELECTORS = {
   promptInput: PROVIDER_CONFIG.chatgpt.selectors.composer,
 
   sendButton:
-    'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]',
+    'button[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Send prompt"], button[aria-label="Send message"]',
 
   responseBlock: PROVIDER_CONFIG.chatgpt.selectors.assistant,
 
@@ -365,7 +389,7 @@ export const SELECTORS = {
     'button[data-testid="stop-button"]',
   ].join(", "),
   /** ChatGPT-generated images render outside the role block, served from the estuary content endpoint. */
-  generatedImage: 'img[src*="/backend-api/estuary/content"], img[alt^="Generated image" i]',
+  generatedImage: GENERATED_IMAGE_SELECTOR,
 
   modelTrigger: [
     'button[data-testid="model-switcher-dropdown-button"]',
@@ -385,8 +409,10 @@ export const SELECTORS = {
   attachmentInput: 'input[type="file"][multiple]:not([accept])',
   attachmentMenuButton: ['button[aria-label="Add files and more"]'],
   attachmentMenuItem: "Add photos & files",
+  attachedFileRemoveButton: 'form button[aria-label^="Remove "]',
 
   accountMenuButton: [
+    'button[aria-label="Open profile menu"]',
     '[data-testid="accounts-profile-button"]',
     '[role="button"][aria-label*="open profile menu" i]',
     'button[data-testid="profile-button"]',
@@ -406,10 +432,34 @@ const isNodeError = (error: unknown): error is NodeJS.ErrnoException => {
   return typeof error === "object" && error !== null && "code" in error;
 };
 
+const ATTACHED_FILE_WAIT_POLLS = 40;
+const ATTACHED_FILE_POLL_MS = 500;
+
 const attachFilesToPrompt = async (page: Page, paths: string[]): Promise<void> => {
   if (paths.length === 0) return;
-  if (await attachFilesViaInput({ page, paths })) return;
-  await attachFilesViaChooser({ page, paths });
+  const chipsBefore = await page.locator(SELECTORS.attachedFileRemoveButton).count();
+  const expectedChips = chipsBefore + paths.length;
+  const isAttachedViaInput = await attachFilesViaInput({ page, paths });
+  if (!isAttachedViaInput) await attachFilesViaChooser({ page, paths });
+  const isShownInComposer = await waitForAttachedFileChips({ page, expectedChips });
+  if (isShownInComposer) return;
+  throw new Error("ChatGPT did not show the attached file in the composer.");
+};
+
+type WaitForAttachedFileChipsContext = {
+  page: Page;
+  expectedChips: number;
+};
+
+// ChatGPT shows a "Remove <file>" chip in the composer once it accepts an upload.
+const waitForAttachedFileChips = async (ctx: WaitForAttachedFileChipsContext): Promise<boolean> => {
+  for (let poll = 0; poll < ATTACHED_FILE_WAIT_POLLS; poll += 1) {
+    const chipCount = await ctx.page.locator(SELECTORS.attachedFileRemoveButton).count();
+    const hasEveryChip = chipCount >= ctx.expectedChips;
+    if (hasEveryChip) return true;
+    await ctx.page.waitForTimeout(ATTACHED_FILE_POLL_MS);
+  }
+  return false;
 };
 
 type OpenAttachmentFileChooserContext = {
@@ -933,10 +983,25 @@ const downloadResolvedAttachment = async (
   });
   await mkdir(outDir, { recursive: true });
   try {
+    if (isChatGptFileUrl(input.attachment.url)) {
+      const downloadUrl = await readChatGptFileDownloadUrl({
+        page: input.page,
+        conversationId: input.conversationId,
+        fileId: fileIdFromChatGptFileUrl(input.attachment.url),
+      });
+      return await downloadHttpAttachment({
+        page: input.page,
+        attachment: input.attachment,
+        url: downloadUrl,
+        outDir,
+        attachments: input.attachments,
+      });
+    }
     if (isHttpUrl(input.attachment.url)) {
       return await downloadHttpAttachment({
         page: input.page,
         attachment: input.attachment,
+        url: input.attachment.url,
         outDir,
         attachments: input.attachments,
       });
@@ -1217,12 +1282,13 @@ const fetchBlobBytes = async (input: FetchBlobInput): Promise<Buffer> => {
 type DownloadHttpInput = {
   page: Page;
   attachment: Attachment;
+  url: string;
   outDir: string;
   attachments: Attachment[];
 };
 
 const downloadHttpAttachment = async (input: DownloadHttpInput): Promise<DownloadResult> => {
-  const httpResponse = await input.page.context().request.get(input.attachment.url);
+  const httpResponse = await input.page.context().request.get(input.url);
   if (!httpResponse.ok())
     throwFailedHttpAttachment({ attachment: input.attachment, status: httpResponse.status() });
   return await saveHttpAttachmentResponse({
@@ -1445,6 +1511,24 @@ export const extractAssistantContent = async (
     extracted: extractContentFromSnapshot(message.root),
     manifestRoot: opts.manifestRoot,
   });
+};
+
+export const registerConversationImages = async (params: {
+  page: Page;
+  conversationId: string;
+  manifestRoot?: string | undefined;
+}): Promise<void> => {
+  const conversation = await readConversationReply(params.page, params.conversationId);
+  const imageRefs = listConversationImageRefs(conversation);
+  const manifest = await loadManifest(params.conversationId, { manifestRoot: params.manifestRoot });
+  const otherAttachments = manifest.attachments.filter((attachment) => attachment.kind !== "image");
+  const imageAttachments = attachmentsFromImageRefs({
+    refs: imageRefs,
+    createdAt: new Date().toISOString(),
+  });
+  manifest.attachments = [...otherAttachments, ...imageAttachments];
+  manifest.counters = countersFromAttachments(manifest.attachments);
+  await saveManifest(manifest, { manifestRoot: params.manifestRoot });
 };
 
 export const extractAllMessages = async (
@@ -2938,7 +3022,7 @@ const navigateToConversation = async (page: Page, url: string): Promise<void> =>
 
 const newConversation = async (page: Page): Promise<void> => {
   await page.goto("https://chatgpt.com/");
-  await page.waitForSelector("#prompt-textarea, [contenteditable]", { timeout: 30_000 });
+  await page.waitForSelector(SELECTORS.promptInput, { timeout: 30_000 });
 };
 
 type SidebarConversationEntry = {
@@ -2947,37 +3031,17 @@ type SidebarConversationEntry = {
   url: string;
 };
 
-type ParseSidebarLinkContext = {
-  link: Locator;
-  orphans: boolean;
-};
-
 type SidebarConversationLink = {
   href: string | null;
   title: string;
-  ariaLabel: string | null;
-};
-
-type SidebarScanElement = HTMLElement & {
-  __bridgeOrphanScan?: {
-    originalScrollTop: number;
-    links: Map<string, SidebarConversationLink>;
-  };
 };
 
 export const parseChatGptSidebarConversationLink = (
   link: SidebarConversationLink,
-  options: { readonly orphans?: boolean } = {},
 ): SidebarConversationEntry | null => {
   const href = link.href === null ? "" : link.href.trim();
   const title = link.title.trim();
   if (!href || !title) return null;
-  const sidebarLabel = link.ariaLabel === null ? "" : link.ariaLabel;
-  const outsideLooseChats =
-    href.includes("/g/") ||
-    /\bchat in project\b/i.test(sidebarLabel) ||
-    /\bpinned conversation\b/i.test(sidebarLabel);
-  if (options.orphans && outsideLooseChats) return null;
   const parsedUrl = new URL(href, "https://chatgpt.com");
   const pathParts = parsedUrl.pathname.split("/").filter(Boolean);
   const lastPathPart = pathParts.pop();
@@ -2986,110 +3050,19 @@ export const parseChatGptSidebarConversationLink = (
   return { id, title, url: parsedUrl.toString() };
 };
 
-const parseSidebarLink = async (
-  ctx: ParseSidebarLinkContext,
-): Promise<SidebarConversationEntry | null> => {
-  const href = await ctx.link.getAttribute("href");
-  const title = await ctx.link.innerText();
-  const ariaLabel = await ctx.link.getAttribute("aria-label");
-  return parseChatGptSidebarConversationLink({ href, title, ariaLabel }, { orphans: ctx.orphans });
+const parseSidebarLink = async (link: Locator): Promise<SidebarConversationEntry | null> => {
+  const href = await link.getAttribute("href");
+  const title = await link.innerText();
+  return parseChatGptSidebarConversationLink({ href, title });
 };
 
-const scanOrphanSidebarConversations = async (page: Page): Promise<SidebarConversationEntry[]> => {
-  await page
-    .locator(`${SELECTORS.sidebarConversation}:not([aria-label*="pinned conversation" i])`)
-    .first()
-    .waitFor({ state: "attached", timeout: 10_000 })
-    .catch(() => {});
-  const sidebar = page.locator('nav[aria-label="Chat history"]').first();
-  if ((await sidebar.count()) === 0) return [];
-  const collectScrollAndReadState = (element: SidebarScanElement) => {
-    const scan = element.__bridgeOrphanScan;
-    if (!scan) throw new Error("ChatGPT sidebar scan was not initialized.");
-    const sidebarRect = element.getBoundingClientRect();
-    for (const link of element.querySelectorAll<HTMLAnchorElement>('a[href^="/c/"]')) {
-      const linkRect = link.getBoundingClientRect();
-      if (linkRect.bottom < sidebarRect.top || linkRect.top > sidebarRect.bottom) continue;
-      const href = link.getAttribute("href");
-      if (!href) continue;
-      let title = link.innerText;
-      if (!title) {
-        const textContent = link.textContent;
-        title = textContent === null ? "" : textContent;
-      }
-      scan.links.set(href, {
-        href,
-        title,
-        ariaLabel: link.getAttribute("aria-label"),
-      });
-    }
-    const state = {
-      size: scan.links.size,
-      scrollHeight: element.scrollHeight,
-      atBottom: element.scrollTop + element.clientHeight >= element.scrollHeight - 4,
-    };
-    const step = Math.max(Math.floor(element.clientHeight * 0.8), 320);
-    element.scrollTop = Math.min(element.scrollTop + step, element.scrollHeight);
-    return state;
-  };
-  await sidebar.evaluate((element: SidebarScanElement) => {
-    element.__bridgeOrphanScan = {
-      originalScrollTop: element.scrollTop,
-      links: new Map(),
-    };
-    element.scrollTop = 0;
-  });
-  await new Promise<void>((resolve) => setTimeout(resolve, 250));
-  let stableBottomPasses = 0;
-  let links: SidebarConversationLink[] = [];
-  try {
-    let reachedStableBottom = false;
-    let before = await sidebar.evaluate(collectScrollAndReadState);
-    for (let pass = 0; pass < 240; pass += 1) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 300));
-      const after = await sidebar.evaluate(collectScrollAndReadState);
-      const unchanged =
-        after.atBottom &&
-        after.size === before.size &&
-        after.scrollHeight <= before.scrollHeight + 1;
-      stableBottomPasses = unchanged ? stableBottomPasses + 1 : 0;
-      if (stableBottomPasses >= 8) {
-        reachedStableBottom = true;
-        break;
-      }
-      before = after;
-    }
-    if (!reachedStableBottom) {
-      throw new Error("ChatGPT sidebar scan did not reach the end of the chat history.");
-    }
-    links = await sidebar.evaluate((element: SidebarScanElement) => {
-      const scan = element.__bridgeOrphanScan;
-      return scan ? [...scan.links.values()] : [];
-    });
-  } finally {
-    await sidebar
-      .evaluate((element: SidebarScanElement) => {
-        const scan = element.__bridgeOrphanScan;
-        if (scan) element.scrollTop = scan.originalScrollTop;
-        delete element.__bridgeOrphanScan;
-      })
-      .catch(() => {});
-  }
-  const conversations = new Map<string, SidebarConversationEntry>();
-  for (const link of links) {
-    const conversation = parseChatGptSidebarConversationLink(link, { orphans: true });
-    if (conversation) conversations.set(conversation.id, conversation);
-  }
-  return [...conversations.values()];
-};
-
-const readAllOrphanSidebarConversations = async (
+const readLooseConversationsFromScanPage = async (
   page: Page,
 ): Promise<SidebarConversationEntry[]> => {
   const scanPage = await page.context().newPage();
   try {
     await scanPage.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded" });
-    return await scanOrphanSidebarConversations(scanPage);
+    return await readLooseConversations(scanPage);
   } finally {
     await scanPage.close().catch(() => {});
   }
@@ -3098,13 +3071,14 @@ const readAllOrphanSidebarConversations = async (
 const readSidebarConversations = async (
   page: Page,
   options: { readonly orphans?: boolean } = {},
-): Promise<Array<{ id: string; title: string; url: string }>> => {
-  if (options.orphans) return readAllOrphanSidebarConversations(page);
+): Promise<SidebarConversationEntry[]> => {
+  if (options.orphans) return readLooseConversationsFromScanPage(page);
   const links = await page.locator(SELECTORS.sidebarConversation).all();
-  const conversations: Array<{ id: string; title: string; url: string }> = [];
+  const conversations: SidebarConversationEntry[] = [];
   for (const link of links) {
-    const entry = await parseSidebarLink({ link, orphans: Boolean(options.orphans) });
-    if (entry) conversations.push(entry);
+    const entry = await parseSidebarLink(link);
+    const isParsedEntry = entry !== null;
+    if (isParsedEntry) conversations.push(entry);
   }
   return conversations;
 };

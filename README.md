@@ -25,6 +25,8 @@ ChatGPT is at its best in the browser — real account state, the model picker, 
 ## Features
 
 - **Terminal-driven ChatGPT** — send prompts and stream replies without leaving the shell; the real browser conversation stays the source of truth.
+- **Your own Edge or Chrome** — `AI_BROWSER_BRIDGE_BROWSER=my-edge` attaches to the Edge you already run instead of a second Chrome; the bridge profile stays the fallback.
+- **Local dashboard + daemon** — `bridge dashboard` serves status, manual ask/fan-out, Resume, and a kill switch on `http://127.0.0.1:8766`; `bridge daemon install` keeps it up after the terminal closes (macOS launchd).
 - **Nine providers, one command** — `chatgpt`, `gemini`, `claude`, `deepseek`, `grok`, `perplexity`, `duck` ([Duck.ai](https://duck.ai/chat)), `arena` ([Arena](https://arena.ai/code/direct) — Direct/Battle/Agent/Side-by-Side + model picker), plus `flow` (Google's Veo video studio — a generation surface, not a chat). Pick one with `--provider`, or **fan out** across several (`--provider claude,deepseek,duck`) and get every reply keyed by provider in one call.
 - **Built for agents** — a stable non-interactive `bridge ask … --json` contract (never hangs in a pipe) plus an outbound MCP `ask` tool, so any agent can drive a web chat.
 - **Sandboxed local tools over MCP** — every file operation is validated against the selected repo root; no arbitrary shell, allowlisted test commands only.
@@ -113,6 +115,36 @@ AI_BROWSER_BRIDGE_CHROME_APP="Google Chrome for Testing" bridge chrome start
 ```
 
 The app override changes only which Chrome build is launched. The profile remains `~/.ai-browser-bridge/chrome-profile`; do not add per-repo Chrome profiles. See Chrome's [remote-debugging profile change](https://developer.chrome.com/blog/remote-debugging-port) for the upstream reason.
+
+### Your own Edge or Chrome (my-edge / my-chrome)
+
+If Edge is already your main browser, you do not need the separate bridge Chrome at all. Attach to the Edge you already run:
+
+```bash
+# One-time, in Edge: open edge://inspect/#remote-debugging and enable remote debugging.
+AI_BROWSER_BRIDGE_BROWSER=my-edge bridge status
+AI_BROWSER_BRIDGE_BROWSER=my-edge bridge ask --provider chatgpt "reply with pong"
+```
+
+Or per command: `bridge ask --browser my-edge --provider grok "…"`. `my-chrome` works the same way with `chrome://inspect/#remote-debugging`. The bridge reads `DevToolsActivePort` from the browser's data root (`~/Library/Application Support/Microsoft Edge` on macOS) and connects over one WebSocket per session — it never passes `--remote-debugging-port` to your real profile, and it never fetches `/json/version` (Edge and newer Chrome answer 404 there). Edge asks you to click **Allow** on every new connection; the bridge cannot click it for you. It always opens a new bridge tab and never types into your own tabs. `bridge stop --browser my-edge` only disconnects — it never kills your browser.
+
+### Dashboard (local only)
+
+```bash
+bridge dashboard --browser my-edge   # http://127.0.0.1:8766
+```
+
+Browser status (read on demand, never polled), a manual ask form with fan-out, Resume to reopen the last provider tab, sessions, MCP tunnel URL, daemon state, permission mode (dashboard asks default to `ask`), and a kill switch. It binds `127.0.0.1` only.
+
+### Daemon (macOS launchd)
+
+```bash
+bridge daemon install --browser my-edge   # starts at login, restarts on crash
+bridge daemon status
+bridge daemon uninstall
+```
+
+The agent runs `bridge dashboard --serve-only`; closing the terminal does not stop it. It holds no browser connection open — each ask reconnects on demand. Log: `~/.ai-browser-bridge/daemon.log`.
 
 **One-shot, non-interactive**
 
@@ -271,7 +303,7 @@ The package was renamed to **`ai-browser-bridge`**. Global user config moved fro
 ```bash
 pnpm test          # vitest run
 pnpm typecheck     # tsc --noEmit
-pnpm verify:push   # Biome + style mirror + typecheck + test + build + boundary/compatibility checks
+pnpm check          # Biome + typecheck + tests + build
 ```
 
 Coverage focuses on the safety-sensitive paths — sandbox validation, canonical repo-root resolution, session/checkpoint stores, permissions, and context counting.

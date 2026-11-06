@@ -1,4 +1,4 @@
-import type { BrowserSession } from "@/features/browser";
+import type { BrowserChoice, BrowserSession } from "@/features/browser";
 import type { BridgeConfig, PermissionMode } from "@/features/domain";
 import type { McpServerHandle, McpToolAction } from "@/features/tools";
 import type { CloudflareTunnel } from "@/features/tunnel";
@@ -13,6 +13,7 @@ export type StartEngineOptions = {
   withBrowser?: boolean;
   debugPort?: number;
   profileRoot?: string;
+  browserChoice?: BrowserChoice;
   withTools?: boolean;
   withTunnel?: boolean;
   persist?: boolean;

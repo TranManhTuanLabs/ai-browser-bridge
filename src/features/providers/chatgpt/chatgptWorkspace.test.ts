@@ -1,9 +1,9 @@
-import { describe, expect, it } from "vitest";
+import type { Page } from "playwright";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  chatGptProjectNameFromConversationAriaLabel,
-  chatGptProjectRemovalState,
-  exactName,
+  moveChatToProject,
   projectNameFromDirectoryRowText,
+  renameChat,
   stripConversationId,
 } from "./chatgptWorkspace.ts";
 
@@ -25,43 +25,6 @@ describe("stripConversationId", () => {
   });
 });
 
-describe("exactName", () => {
-  it("matches the exact name and rejects longer strings", () => {
-    const re = exactName("Email Sender");
-    expect(re.test("Email Sender")).toBe(true);
-    expect(re.test("Email Sender 2")).toBe(false);
-    expect(re.test("My Email Sender")).toBe(false);
-  });
-
-  it("escapes regex metacharacters in project names", () => {
-    const re = exactName("A+B (v2)");
-    expect(re.test("A+B (v2)")).toBe(true);
-    expect(re.test("AXB (v2)")).toBe(false);
-  });
-});
-
-describe("chatGptProjectRemovalState", () => {
-  it("only confirms the requested project from its named removal action", () => {
-    expect(chatGptProjectRemovalState(true, false)).toBe("already-filed");
-    expect(chatGptProjectRemovalState(false, true)).toBe("current-project-unknown");
-    expect(chatGptProjectRemovalState(false, false)).toBe("not-filed");
-  });
-});
-
-describe("chatGptProjectNameFromConversationAriaLabel", () => {
-  it("reads the current Project from a project-owned Conversation link", () => {
-    expect(
-      chatGptProjectNameFromConversationAriaLabel(
-        "Morning routine notes, chat in project Yoga App",
-      ),
-    ).toBe("Yoga App");
-  });
-
-  it("does not infer a Project from a regular Conversation label", () => {
-    expect(chatGptProjectNameFromConversationAriaLabel("Morning routine notes")).toBeNull();
-  });
-});
-
 describe("projectNameFromDirectoryRowText", () => {
   it("reads the project name from ChatGPT's current directory row", () => {
     expect(projectNameFromDirectoryRowText("Yoga App\n1w")).toBe("Yoga App");
@@ -73,5 +36,204 @@ describe("projectNameFromDirectoryRowText", () => {
 
   it("preserves a project named Name", () => {
     expect(projectNameFromDirectoryRowText("Name\nToday")).toBe("Name");
+  });
+});
+
+const CHAT_ID = "6ac400c8-44a8-83ed-857f-6ff0df0052d6";
+const PORTFOLIO_PROJECT_ID = "g-p-fixture-portfolio";
+
+interface FakeConversationApi {
+  conversationTemplateId: string | null;
+  patchStatus: number;
+  acceptsPatch: boolean;
+  patchBodies: unknown[];
+}
+
+const fakePage = (): Page => {
+  return {
+    evaluate: async (pageFunction: (argument: unknown) => Promise<unknown>, argument: unknown) =>
+      pageFunction(argument),
+  } as unknown as Page;
+};
+
+const stubConversationApi = (api: FakeConversationApi): void => {
+  vi.stubGlobal("fetch", async (requestPath: string, init?: RequestInit) => {
+    const isSessionRequest = requestPath === "/api/auth/session";
+    if (isSessionRequest) return Response.json({ accessToken: "test-access-token" });
+
+    const isPatchRequest = init?.method === "PATCH";
+    if (isPatchRequest) {
+      const patchBody = JSON.parse(String(init?.body)) as { gizmo_id: string };
+      api.patchBodies.push(patchBody);
+      if (api.acceptsPatch) api.conversationTemplateId = patchBody.gizmo_id;
+      return new Response("", { status: api.patchStatus });
+    }
+    return Response.json({ conversation_template_id: api.conversationTemplateId });
+  });
+};
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("moveChatToProject", () => {
+  it("moves the chat with one PATCH and confirms it with a second read", async () => {
+    const api: FakeConversationApi = {
+      conversationTemplateId: null,
+      patchStatus: 200,
+      acceptsPatch: true,
+      patchBodies: [],
+    };
+    stubConversationApi(api);
+
+    const outcome = await moveChatToProject(fakePage(), {
+      chat: CHAT_ID,
+      project: "Portfolio",
+      projectId: PORTFOLIO_PROJECT_ID,
+    });
+
+    expect(outcome.moved).toBe(true);
+    expect(api.patchBodies).toEqual([{ gizmo_id: PORTFOLIO_PROJECT_ID }]);
+  });
+
+  it("reports alreadyFiled without a PATCH when the chat is already in the Project", async () => {
+    const api: FakeConversationApi = {
+      conversationTemplateId: PORTFOLIO_PROJECT_ID,
+      patchStatus: 200,
+      acceptsPatch: true,
+      patchBodies: [],
+    };
+    stubConversationApi(api);
+
+    const outcome = await moveChatToProject(fakePage(), {
+      chat: CHAT_ID,
+      project: "Portfolio",
+      projectId: PORTFOLIO_PROJECT_ID,
+    });
+
+    expect(outcome.alreadyFiled).toBe(true);
+    expect(api.patchBodies).toEqual([]);
+  });
+
+  it("returns rateLimited when the move is answered with HTTP 429", async () => {
+    const api: FakeConversationApi = {
+      conversationTemplateId: null,
+      patchStatus: 429,
+      acceptsPatch: false,
+      patchBodies: [],
+    };
+    stubConversationApi(api);
+
+    const outcome = await moveChatToProject(fakePage(), {
+      chat: CHAT_ID,
+      project: "Portfolio",
+      projectId: PORTFOLIO_PROJECT_ID,
+    });
+
+    expect(outcome.rateLimited).toBe(true);
+    expect(outcome.moved).toBe(false);
+  });
+
+  it("does not report the move as done when ChatGPT still shows the chat loose", async () => {
+    const api: FakeConversationApi = {
+      conversationTemplateId: null,
+      patchStatus: 200,
+      acceptsPatch: false,
+      patchBodies: [],
+    };
+    stubConversationApi(api);
+
+    const outcome = await moveChatToProject(fakePage(), {
+      chat: CHAT_ID,
+      project: "Portfolio",
+      projectId: PORTFOLIO_PROJECT_ID,
+    });
+
+    expect(outcome.moved).toBe(false);
+    expect(outcome.reason).toBe('ChatGPT did not confirm the move into project "Portfolio"');
+  });
+});
+
+interface FakeRenameApi {
+  title: string;
+  patchStatus: number;
+  acceptsPatch: boolean;
+  patchBodies: unknown[];
+}
+
+const RENAMED_TITLE = "Project docs: Garden Notes";
+
+const stubRenameApi = (api: FakeRenameApi): void => {
+  vi.stubGlobal("fetch", async (requestPath: string, init?: RequestInit) => {
+    const isSessionRequest = requestPath === "/api/auth/session";
+    if (isSessionRequest) return Response.json({ accessToken: "test-access-token" });
+
+    const isPatchRequest = init?.method === "PATCH";
+    if (isPatchRequest) {
+      const patchBody = JSON.parse(String(init?.body)) as { title: string };
+      api.patchBodies.push(patchBody);
+      if (api.acceptsPatch) api.title = patchBody.title;
+      return new Response("", { status: api.patchStatus });
+    }
+    return Response.json({ conversation_template_id: null, title: api.title });
+  });
+};
+
+describe("renameChat", () => {
+  it("renames the chat with one PATCH and returns the title a GET confirms", async () => {
+    const api: FakeRenameApi = {
+      title: "Saved",
+      patchStatus: 200,
+      acceptsPatch: true,
+      patchBodies: [],
+    };
+    stubRenameApi(api);
+
+    const renamedChat = await renameChat(fakePage(), { chat: CHAT_ID, title: RENAMED_TITLE });
+
+    expect(renamedChat).toEqual({ id: CHAT_ID, title: RENAMED_TITLE });
+    expect(api.patchBodies).toEqual([{ title: RENAMED_TITLE }]);
+  });
+
+  it("throws a rate-limit error when the rename is answered with HTTP 429", async () => {
+    const api: FakeRenameApi = {
+      title: "Saved",
+      patchStatus: 429,
+      acceptsPatch: false,
+      patchBodies: [],
+    };
+    stubRenameApi(api);
+
+    const renaming = renameChat(fakePage(), { chat: CHAT_ID, title: RENAMED_TITLE });
+
+    await expect(renaming).rejects.toThrow("ChatGPT rate-limited the chat rename (HTTP 429)");
+  });
+
+  it("throws on any other failed rename reply", async () => {
+    const api: FakeRenameApi = {
+      title: "Saved",
+      patchStatus: 500,
+      acceptsPatch: false,
+      patchBodies: [],
+    };
+    stubRenameApi(api);
+
+    const renaming = renameChat(fakePage(), { chat: CHAT_ID, title: RENAMED_TITLE });
+
+    await expect(renaming).rejects.toThrow("ChatGPT chat rename failed with HTTP 500.");
+  });
+
+  it("throws when the GET still shows the old title after the PATCH", async () => {
+    const api: FakeRenameApi = {
+      title: "Saved",
+      patchStatus: 200,
+      acceptsPatch: false,
+      patchBodies: [],
+    };
+    stubRenameApi(api);
+
+    const renaming = renameChat(fakePage(), { chat: CHAT_ID, title: RENAMED_TITLE });
+
+    await expect(renaming).rejects.toThrow("did not confirm the new title");
   });
 });

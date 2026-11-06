@@ -35,20 +35,12 @@
     "start": "node dist/bridge.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/bridge.tsbuildinfo",
     "format": "biome format --write ./",
     "format:check": "biome format ./",
-    "lint": "biome lint ./",
+    "lint": "biome check . && knip",
     "lint:fix": "biome check --write ./",
-    "check:ci": "biome ci ./",
-    "check:style-guide": "node scripts/checkStyleGuide.mjs",
-    "check:boundaries": "node scripts/checkBoundaries.mjs",
-    "check:no-compatibility": "node scripts/checkNoCompatibility.mjs",
-    "verify": "pnpm run check:ci && pnpm run check:style-guide && pnpm run typecheck && pnpm test && pnpm run build && pnpm run check:boundaries && pnpm run check:no-compatibility",
-    "verify:push": "pnpm run verify"
-  },
-  "lint-staged": {
-    "*.{ts,tsx,mjs,json,jsonc}": "biome check --write --no-errors-on-unmatched"
+    "check": "turbo run lint typecheck test build --output-logs=errors-only"
   },
   "keywords": [
     "chatgpt",
@@ -76,8 +68,9 @@
     "@types/node": "^22.15.3",
     "@types/react": "^18.3.12",
     "husky": "^9.1.7",
-    "lint-staged": "^15.2.10",
+    "knip": "6.43.0",
     "tsup": "^8.4.0",
+    "turbo": "2.11.8",
     "typescript": "^5.7.3",
     "vitest": "^3.1.2"
   }

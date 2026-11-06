@@ -8,7 +8,11 @@ not a copied style guide.
 
 - This repo is a terminal CLI that drives ChatGPT, Gemini, Claude, DeepSeek,
   Grok, Perplexity, Duck.ai, Arena, Flow, or Claude Design in Chrome and exposes sandboxed
-  local repo tools over MCP.
+  local repo tools over MCP. It can also attach to the user's own Edge or Chrome
+  (`my-edge` / `my-chrome`) instead of launching the bridge Chrome, and it
+  ships a local-only dashboard (`bridge dashboard`) and a macOS launchd daemon
+  (`bridge daemon`). Status is read on demand; nothing polls the browser, and
+  the bridge never auto-switches provider or kills the user's own browser.
 - ChatGPT can use the inbound MCP tool server. Other local agents can use
   outbound MCP `ask`, `search_conversations`, and the `flow_*`, `chatgpt_*`, and
   `design_*` tools through `bridge serve`.
@@ -17,8 +21,6 @@ not a copied style guide.
 
 ## Source Of Truth
 
-- For code style, read `CODE-STYLE.md` before editing source, tests, scripts, or
-  public docs.
 - For product intent, read `PROJECT.md` before changing user-facing behavior.
 - For domain language, read `LANGUAGE.md` before renaming concepts, tools,
   commands, or public APIs.
@@ -42,6 +44,8 @@ not a copied style guide.
 |---------|------|-------------|
 | `bridge` | Engine start, orchestrator | `BridgeEngine`, `Orchestrator` |
 | `browser` | CDP attach, shared bridge profile launch, browser status, generated-cache inventory/prune | `BrowserSession` |
+| `dashboard` | Local-only dashboard server on 127.0.0.1:8766 (on-demand status, manual ask, Resume, kill switch) | `serveDashboard` |
+| `daemon` | macOS launchd agent that keeps the dashboard server up | `installDaemon` |
 | `providers/chatgpt` | ChatGPT DOM behavior, MCP connector UI, provider-specific history source | `chatGptProvider` |
 | `providers/gemini` | Gemini DOM behavior | `geminiProvider` |
 | `providers/arena` | Arena.ai modes + model picker + dual Option A/B capture | `arenaProvider` |
@@ -59,13 +63,10 @@ not a copied style guide.
 
 ## Conventions
 
-<!-- rules digest - full guide in CODE-STYLE.md; edit there -->
-
 - Cross-feature imports go through `@/features/<name>` `index.ts` doors. Never
   deep-import another feature's implementation.
 - `src/config.ts` is the shared data leaf for provider metadata and defaults
   (Schema-validated tables + `Effect.Config` for env).
-- Code style details live in `CODE-STYLE.md`; mirror only a short digest here.
 - New or touched code uses plain TypeScript and Promises, with Effect Schema and
   Config only at trust/configuration boundaries.
 - Use precise domain names, early guards, explicit branches, named exports,
@@ -82,11 +83,12 @@ not a copied style guide.
 ## Verification
 
 ```bash
-pnpm verify
+pnpm check
 ```
 
-This runs Biome, the style-guide mirror check, typecheck, tests, build, the
-feature-boundary check, and the no-compatibility check.
+This runs Biome, typecheck, tests, and build. The pre-push hook runs it,
+so a new worktree needs `pnpm install` before its first push. CI runs only test
+and build, on Linux.
 
 ## Safety
 
@@ -96,8 +98,3 @@ feature-boundary check, and the no-compatibility check.
 - TypeScript strict plus `noUncheckedIndexedAccess`; no `any`.
 - No cross-feature service-class imports; reach another feature only via its
   `index.ts` door and the `@/` alias.
-
-## Local CI
-
-Run `act workflow_dispatch -W .github/workflows/ci.yml` before opening a PR.
-The root `.actrc` selects the local Docker runner and keeps the pnpm store outside the workspace.

@@ -1,4 +1,10 @@
 import type { Locator, Page } from "playwright";
+import {
+  type ChatGptApiReply,
+  type ChatGptApiReplyState,
+  chatGptApiReplyStateFrom,
+  requestChatGptApi,
+} from "./chatgptBackendApi.ts";
 import { searchChatGptConversations } from "./chatgptConversationSearch.ts";
 import { chatGptConversationIdFromUrl } from "./chatgptConversationUrl.ts";
 
@@ -10,18 +16,20 @@ const WORKSPACE = {
   projectsUrl: "https://chatgpt.com/projects",
   scheduledUrl: "https://chatgpt.com/scheduled",
   sidebarProjects: '[data-testid="sidebar-item-projects"]',
-  sidebarTasks: '[data-testid="sidebar-item-tasks"]',
   newProjectButton: 'button[aria-label="Add new project"]',
   projectNameInput: 'input[name="project-name"]',
   projectFolderIcon: '[data-testid="project-folder-icon"]',
   projectDirectoryRow: "[data-projects-rows] [data-project-row]",
-  projectOpenButton: "Start new chat in project",
-  projectPageUrl: /\/g\/g-p-[^/]+\/project/,
-  projectConversationLink: 'main a[href*="/c/"]',
   chatLink: 'nav a[href*="/c/"]',
-  activeConversationMenu: '[data-testid="conversation-options-button"]',
+  activeConversationMenu:
+    '[data-testid="conversation-options-button"], button[aria-label="Chat actions"][aria-haspopup="menu"]',
   menuItem: '[role="menuitem"]',
+  sidebarOptionsButton:
+    'button[aria-label="Chat actions"], button[aria-label^="Open conversation options"]',
 } as const;
+
+const SIDEBAR_OPTIONS_BUTTON_XPATH =
+  '@aria-label="Chat actions" or starts-with(@aria-label, "Open conversation options")';
 
 export const projectNameFromDirectoryRowText = (text: string): string | null => {
   const [name, detail] = text.split("\n");
@@ -93,6 +101,7 @@ export type MoveChatOutcome = {
   project: string;
   moved: boolean;
   alreadyFiled?: boolean;
+  rateLimited?: boolean;
   reason?: string;
 };
 
@@ -107,29 +116,22 @@ export type WorkspaceTask = {
   schedule?: string;
 };
 
-// chat: conversation id (`/c/<id>`) or exact sidebar title.
+// chat: conversation id (`/c/<id>`) or exact sidebar title. projectId: the Project's `g-p-…` id.
 export type MoveChatInput = {
   chat: string;
   project: string;
+  projectId: string;
 };
 
-export const chatGptProjectRemovalState = (
-  namedRemoval: boolean,
-  genericRemoval: boolean,
-): "already-filed" | "current-project-unknown" | "not-filed" => {
-  if (namedRemoval) return "already-filed";
-  if (genericRemoval) return "current-project-unknown";
-  return "not-filed";
-};
+export interface RenameChatInput {
+  chat: string;
+  title: string;
+}
 
-export const chatGptProjectNameFromConversationAriaLabel = (label: string): string | null => {
-  const marker = ", chat in project ";
-  const markerIndex = label.lastIndexOf(marker);
-  if (markerIndex < 0) return null;
-  const project = label.slice(markerIndex + marker.length).trim();
-  if (!project) return null;
-  return project;
-};
+export interface RenamedChat {
+  id: string;
+  title: string;
+}
 
 export const listProjects = async (page: Page): Promise<WorkspaceProject[]> => {
   await ensureOnProjectsPage(page);
@@ -151,153 +153,6 @@ export const listProjects = async (page: Page): Promise<WorkspaceProject[]> => {
     .catch(() => {});
   const names = await page.evaluate<string[]>(PROJECT_ROWS_SOURCE);
   return names.map((name) => ({ name }));
-};
-
-const openProject = async (page: Page, project: string): Promise<boolean> => {
-  await ensureOnProjectsPage(page);
-  const directoryRows = page.locator(WORKSPACE.projectDirectoryRow);
-  await directoryRows
-    .first()
-    .waitFor({ state: "visible", timeout: 8_000 })
-    .catch(() => {});
-  const directoryIndex = (await directoryRows.allInnerTexts()).findIndex(
-    (rowText) => projectNameFromDirectoryRowText(rowText) === project,
-  );
-  if (directoryIndex >= 0) {
-    const openButton = directoryRows
-      .nth(directoryIndex)
-      .getByRole("button", { name: WORKSPACE.projectOpenButton, exact: true });
-    try {
-      await openButton.click({ timeout: 8_000 });
-      await page.waitForURL(WORKSPACE.projectPageUrl, { timeout: 8_000 });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  try {
-    await page.locator(WORKSPACE.projectFolderIcon).first().waitFor({
-      state: "visible",
-      timeout: 8_000,
-    });
-  } catch {
-    return false;
-  }
-  const projectRows = page
-    .locator(WORKSPACE.projectFolderIcon)
-    .locator('xpath=ancestor::*[@role="row" or self::a or self::li][1]');
-  const rowCount = await projectRows.count();
-  for (let index = 0; index < rowCount; index += 1) {
-    const projectRow = projectRows.nth(index);
-    const [projectName] = (await projectRow.innerText()).split("\n");
-    if (projectName?.trim() !== project) continue;
-    await projectRow.evaluate((row) => {
-      if (row instanceof HTMLElement) row.click();
-    });
-    const heading = page.locator("main").getByText(project, { exact: true }).first();
-    try {
-      await heading.waitFor({ state: "visible", timeout: 8_000 });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  return false;
-};
-
-const projectPageContainsConversation = async (
-  page: Page,
-  conversation: string,
-): Promise<boolean> => {
-  const identifier = stripConversationId(conversation);
-  const identifierIsId = /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(identifier);
-  for (let poll = 0; poll < 50; poll += 1) {
-    const found = await page.locator(WORKSPACE.projectConversationLink).evaluateAll(
-      (links, target) => {
-        for (const link of links) {
-          const href = link.getAttribute("href");
-          if (href !== null && target.identifierIsId && href.includes(`/c/${target.identifier}`)) {
-            return true;
-          }
-          const text = link instanceof HTMLElement ? link.innerText : link.textContent;
-          let normalizedText = "";
-          if (text !== null) normalizedText = text;
-          const title = normalizedText.split("\n")[0]?.trim();
-          if (!target.identifierIsId && title === target.identifier) return true;
-        }
-        return false;
-      },
-      { identifier, identifierIsId },
-    );
-    if (found) return true;
-    const loadMore = page.getByText("Load more conversations", { exact: true }).first();
-    if (!(await loadMore.isVisible())) {
-      // Project navigation can render the heading several seconds before its chat cards.
-      // Keep polling before treating an empty page as proof that the chat is absent.
-      if (poll >= 19) return false;
-      await page.waitForTimeout(500);
-      continue;
-    }
-    await loadMore.evaluate((label) => {
-      let clickTarget: Element = label;
-      const button = label.closest("button");
-      if (button !== null) clickTarget = button;
-      if (clickTarget instanceof HTMLElement) clickTarget.click();
-    });
-    await page.waitForTimeout(700);
-  }
-  return false;
-};
-
-const projectContainsConversation = async (
-  page: Page,
-  project: string,
-  conversation: string,
-): Promise<boolean> => {
-  const originalUrl = page.url();
-  try {
-    if (!(await openProject(page, project))) return false;
-    await page.waitForTimeout(800);
-    return await projectPageContainsConversation(page, conversation);
-  } finally {
-    if (page.url() !== originalUrl) await gotoStable(page, originalUrl);
-  }
-};
-
-const conversationLinkIdentifiesProject = async (
-  page: Page,
-  conversation: string,
-  project: string,
-): Promise<boolean> => {
-  const identifier = stripConversationId(conversation);
-  const identifierIsId = /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(identifier);
-  let links = page.locator(WORKSPACE.chatLink);
-  if (identifierIsId) links = page.locator(`nav a[href*="/c/${identifier}"]`);
-  else links = links.filter({ hasText: exactName(identifier) });
-  const count = await links.count();
-  for (let index = 0; index < count; index += 1) {
-    const ariaLabel = await links.nth(index).getAttribute("aria-label");
-    if (ariaLabel === null) continue;
-    if (chatGptProjectNameFromConversationAriaLabel(ariaLabel) === project) return true;
-  }
-  return false;
-};
-
-const activeConversationHeaderIdentifiesProject = async (
-  page: Page,
-  project: string,
-): Promise<boolean> => {
-  if (!/\/g\/g-p-[^/]+\/c\//i.test(page.url())) return false;
-  try {
-    await page
-      .locator("header")
-      .getByText(project, { exact: true })
-      .first()
-      .waitFor({ state: "visible", timeout: 2_000 });
-    return true;
-  } catch {
-    return false;
-  }
 };
 
 // Fresh tabs abort goto while their own initial navigation is still in flight
@@ -479,134 +334,142 @@ export const deleteProject = async (page: Page, project: string): Promise<Delete
   return { ...base, deleted: true };
 };
 
+const CHATGPT_RATE_LIMIT_REASON = "ChatGPT rate limit (HTTP 429)";
+const CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-/i;
+
+interface ConversationApiReply {
+  conversation_template_id: string | null;
+  title: string | null;
+}
+
+interface ConversationApiRead {
+  state: ChatGptApiReplyState;
+  status: number;
+  conversationTemplateId: string | null;
+}
+
+const apiPathForConversation = (conversationId: string): string =>
+  `/backend-api/conversation/${encodeURIComponent(conversationId)}`;
+
+const markMoveRateLimited = (base: MoveChatOutcome): MoveChatOutcome => ({
+  ...base,
+  rateLimited: true,
+  reason: CHATGPT_RATE_LIMIT_REASON,
+});
+
+const readConversationApi = async (
+  page: Page,
+  conversationId: string,
+): Promise<ConversationApiRead> => {
+  const reply = await requestChatGptApi(page, {
+    method: "GET",
+    apiPath: apiPathForConversation(conversationId),
+  });
+  const state = chatGptApiReplyStateFrom(reply.status);
+  const isReadOk = state === "ok";
+  if (!isReadOk) return { state, status: reply.status, conversationTemplateId: null };
+
+  const conversation = JSON.parse(reply.bodyText) as ConversationApiReply;
+  return {
+    state,
+    status: reply.status,
+    conversationTemplateId: conversation.conversation_template_id,
+  };
+};
+
+const findConversationIdForChat = async (page: Page, chat: string): Promise<string | null> => {
+  const conversationId = stripConversationId(chat);
+  const isIdentifier = CONVERSATION_ID_PATTERN.test(conversationId);
+  if (isIdentifier) return conversationId;
+
+  const results = await searchChatGptConversations(page, { query: chat, limit: 20 });
+  const exactResult = results.find((result) => result.title.trim() === chat.trim());
+  return exactResult?.id ?? null;
+};
+
+// One PATCH moves the chat; a GET before and after decides what happened. A 429 is reported as
+// rateLimited so the queue defers the item without spending an attempt.
 export const moveChatToProject = async (
   page: Page,
   input: MoveChatInput,
 ): Promise<MoveChatOutcome> => {
   const base: MoveChatOutcome = { chat: input.chat, project: input.project, moved: false };
-  const conversationId = stripConversationId(input.chat);
-  const identifierIsId = /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(conversationId);
-  if (identifierIsId && chatGptConversationIdFromUrl(page.url()) !== conversationId) {
-    await gotoStable(page, `https://chatgpt.com/c/${conversationId}`);
-    await waitForActiveConversationMenu(page, conversationId);
+  const conversationId = await findConversationIdForChat(page, input.chat);
+  const isChatMissing = conversationId === null;
+  if (isChatMissing) return { ...base, reason: `no chat titled "${input.chat}"` };
+
+  const before = await readConversationApi(page, conversationId);
+  if (before.state === "rate-limited") return markMoveRateLimited(base);
+  if (before.state === "failed") {
+    return { ...base, reason: `ChatGPT returned HTTP ${before.status} for the chat` };
   }
-  if (
-    (await activeConversationHeaderIdentifiesProject(page, input.project)) ||
-    (await conversationLinkIdentifiesProject(page, input.chat, input.project))
-  ) {
+
+  const isAlreadyFiled = before.conversationTemplateId === input.projectId;
+  if (isAlreadyFiled) {
+    return { ...base, alreadyFiled: true, reason: `already in project "${input.project}"` };
+  }
+
+  const moveReply = await requestChatGptApi(page, {
+    method: "PATCH",
+    apiPath: apiPathForConversation(conversationId),
+    body: { gizmo_id: input.projectId },
+  });
+  const moveState = chatGptApiReplyStateFrom(moveReply.status);
+  if (moveState === "rate-limited") return markMoveRateLimited(base);
+  if (moveState === "failed") {
     return {
       ...base,
-      alreadyFiled: true,
-      reason: `already in project "${input.project}"`,
+      reason: `ChatGPT rejected the move into project "${input.project}" (HTTP ${moveReply.status})`,
     };
   }
-  if (!(await openConversationMenu(page, input.chat))) {
-    return { ...base, reason: "could not open the chat ⋯ menu" };
-  }
-  const visibleMenuItems = page.locator(`${WORKSPACE.menuItem}:visible`);
-  const moveItem = visibleMenuItems.filter({ hasText: /^Move to project$/i }).first();
-  try {
-    await moveItem.waitFor({ state: "visible", timeout: 5_000 });
-  } catch {
-    await dismissMenu(page);
-    return { ...base, reason: "no 'Move to project' option (GPT- or project-owned chat)" };
-  }
-  // Hover expands the project submenu; poll before falling back to a click (clicking an
-  // already-open trigger can toggle it shut). Match visible text, not accessible name:
-  // each project item's folder-icon svg pollutes the computed name with "Default color…Folder".
-  const targetOf = () =>
-    page
-      .locator(`${WORKSPACE.menuItem}:visible`)
-      .filter({ hasText: exactName(input.project) })
-      .first();
-  const removalStateOf = async () => {
-    const namedRemoval = page.locator(`${WORKSPACE.menuItem}:visible`).filter({
-      hasText: new RegExp(`^Remove from ${escapeRegExp(input.project)}$`, "i"),
-    });
-    const genericRemoval = page
-      .locator(`${WORKSPACE.menuItem}:visible`)
-      .filter({ hasText: /^Remove from project$/i });
-    return chatGptProjectRemovalState(
-      (await namedRemoval.count()) > 0,
-      (await genericRemoval.count()) > 0,
-    );
-  };
-  const newProjectItem = page
-    .locator(`${WORKSPACE.menuItem}:visible`)
-    .filter({ hasText: /^New project$/i });
-  await moveItem.hover().catch(() => {});
-  let target = targetOf();
-  let visible = false;
-  let removalState: ReturnType<typeof chatGptProjectRemovalState> = "not-filed";
-  let submenuVisible = false;
-  for (let attempt = 0; attempt < 2 && !visible && removalState === "not-filed"; attempt += 1) {
-    if (attempt > 0 && !submenuVisible) await moveItem.click().catch(() => {});
-    for (let poll = 0; poll < 40 && !visible && removalState === "not-filed"; poll += 1) {
-      try {
-        await target.waitFor({ state: "visible", timeout: 350 });
-        visible = true;
-      } catch {
-        visible = false;
-      }
-      removalState = await removalStateOf();
-      submenuVisible = submenuVisible || (await newProjectItem.count()) > 0;
-      if (!visible && removalState === "not-filed") await page.waitForTimeout(150);
-      target = targetOf();
-    }
-  }
-  if (!visible) {
-    // The submenu omits the current project and labels its removal action with or without a name.
-    await dismissMenu(page);
-    if (removalState === "already-filed") {
-      return {
-        ...base,
-        alreadyFiled: true,
-        reason: `already in project "${input.project}"`,
-      };
-    }
-    if (removalState === "current-project-unknown") {
-      let confirmed = await conversationLinkIdentifiesProject(page, input.chat, input.project);
-      if (!confirmed)
-        confirmed = await projectContainsConversation(page, input.project, input.chat);
-      if (confirmed) {
-        return {
-          ...base,
-          alreadyFiled: true,
-          reason: `already in project "${input.project}"`,
-        };
-      }
-      return {
-        ...base,
-        reason: `chat is already in a project, but ChatGPT did not identify which one`,
-      };
-    }
-    return {
-      ...base,
-      reason: `project "${input.project}" not found — create it first`,
-    };
-  }
-  const projectSelected = await target
-    .evaluate((projectItem) => {
-      if (projectItem instanceof HTMLElement) projectItem.click();
-    })
-    .then(() => true)
-    .catch(() => false);
-  if (!projectSelected) {
-    await dismissMenu(page);
-    return { ...base, reason: `could not select project "${input.project}"` };
-  }
-  await page.waitForTimeout(800);
-  let confirmed = await activeConversationHeaderIdentifiesProject(page, input.project);
-  if (!confirmed)
-    confirmed = await conversationLinkIdentifiesProject(page, input.chat, input.project);
-  if (!confirmed) confirmed = await projectContainsConversation(page, input.project, input.chat);
-  if (!confirmed) {
-    return {
-      ...base,
-      reason: `ChatGPT did not confirm the move into project "${input.project}"`,
-    };
+
+  const after = await readConversationApi(page, conversationId);
+  if (after.state === "rate-limited") return markMoveRateLimited(base);
+
+  const isMoveConfirmed = after.conversationTemplateId === input.projectId;
+  if (!isMoveConfirmed) {
+    return { ...base, reason: `ChatGPT did not confirm the move into project "${input.project}"` };
   }
   return { ...base, moved: true };
+};
+
+const requireChatGptReplyOk = (reply: ChatGptApiReply, action: string): void => {
+  const state = chatGptApiReplyStateFrom(reply.status);
+  const isReplyOk = state === "ok";
+  if (isReplyOk) return;
+
+  const isRateLimited = state === "rate-limited";
+  if (isRateLimited) {
+    throw new Error(`ChatGPT rate-limited the chat ${action} (HTTP 429). Resume later.`);
+  }
+  throw new Error(`ChatGPT chat ${action} failed with HTTP ${reply.status}.`);
+};
+
+// One PATCH renames the chat; a GET confirms the title ChatGPT now stores. Any failure throws.
+export const renameChat = async (page: Page, input: RenameChatInput): Promise<RenamedChat> => {
+  const conversationId = await findConversationIdForChat(page, input.chat);
+  const isChatMissing = conversationId === null;
+  if (isChatMissing) throw new Error(`no chat titled "${input.chat}"`);
+
+  const renameReply = await requestChatGptApi(page, {
+    method: "PATCH",
+    apiPath: apiPathForConversation(conversationId),
+    body: { title: input.title },
+  });
+  requireChatGptReplyOk(renameReply, "rename");
+
+  const confirmReply = await requestChatGptApi(page, {
+    method: "GET",
+    apiPath: apiPathForConversation(conversationId),
+  });
+  requireChatGptReplyOk(confirmReply, "rename check");
+  const conversation = JSON.parse(confirmReply.bodyText) as ConversationApiReply;
+
+  const isTitleConfirmed = conversation.title === input.title;
+  if (!isTitleConfirmed) {
+    throw new Error(`ChatGPT did not confirm the new title for chat ${conversationId}.`);
+  }
+  return { id: conversationId, title: input.title };
 };
 
 // Archive is reversible (Settings → Archived chats). Reports skips; never throws.
@@ -687,15 +550,17 @@ const findChatRow = async (page: Page, chat: string): Promise<Locator | null> =>
 // Options button is inside the row anchor (not a sibling). Radix trigger under sticky
 // header intercepts coordinate clicks — dispatch pointerdown on the element.
 const openChatMenu = async (page: Page, row: Locator): Promise<boolean> => {
-  const li = row.locator("xpath=ancestor-or-self::li[1]");
-  const scope = (await li.count()) > 0 ? li : row;
+  const rowWithOptions = row.locator(
+    `xpath=ancestor-or-self::*[.//button[${SIDEBAR_OPTIONS_BUTTON_XPATH}]][1]`,
+  );
+  const scope = (await rowWithOptions.count()) > 0 ? rowWithOptions : row;
   await scope.hover().catch(() => {});
   await page.waitForTimeout(200);
-  const optionsButton = scope.locator('button[aria-label^="Open conversation options"]').first();
-  const trigger =
-    (await optionsButton.count()) > 0 ? optionsButton : scope.getByRole("button").last();
+  const optionsButton = scope.locator(WORKSPACE.sidebarOptionsButton).first();
+  const isOptionsButtonMissing = (await optionsButton.count()) === 0;
+  if (isOptionsButtonMissing) return false;
   try {
-    await trigger.dispatchEvent("pointerdown", {
+    await optionsButton.dispatchEvent("pointerdown", {
       button: 0,
       isPrimary: true,
       pointerType: "mouse",
@@ -718,7 +583,13 @@ const openConversationMenu = async (page: Page, chat: string): Promise<boolean> 
     return true;
   }
   const row = await findChatRow(page, chat);
-  if (row !== null) return openChatMenu(page, row);
+  if (row !== null) {
+    const isSidebarMenuOpen = await openChatMenu(page, row);
+    const shouldTryHeaderMenu = !isSidebarMenuOpen && targetLooksLikeId;
+    if (!shouldTryHeaderMenu) return isSidebarMenuOpen;
+    await gotoStable(page, `https://chatgpt.com/c/${targetConversationId}`);
+    return openActiveConversationMenu(page, targetConversationId);
+  }
   if (!targetLooksLikeId) {
     const results = await searchChatGptConversations(page, { query: chat, limit: 20 });
     const exactResult = results.find((result) => result.title.trim() === chat.trim());
@@ -786,6 +657,9 @@ const waitForActiveConversationMenu = async (
   return false;
 };
 
+// The open chat menu heads its "Move to project" rows with the current project's name.
+// The label appears a moment after the menu opens, so poll for it.
+// ChatGPT saves a move a moment after the click, and a reload too early cancels it.
 const dismissMenu = async (page: Page): Promise<void> => {
   await page.keyboard.press("Escape").catch(() => {});
   await page.keyboard.press("Escape").catch(() => {});
@@ -797,12 +671,6 @@ export const listTasks = async (page: Page): Promise<WorkspaceTask[]> => {
     await page.waitForTimeout(1_200);
   }
   return page.evaluate<WorkspaceTask[]>(SCHEDULED_ROWS_SOURCE);
-};
-
-const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-export const exactName = (value: string): RegExp => {
-  return new RegExp(`^${escapeRegExp(value)}$`);
 };
 
 export const stripConversationId = (idOrUrl: string): string => {

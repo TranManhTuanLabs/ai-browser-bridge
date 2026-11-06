@@ -7,9 +7,11 @@ export type CliOptions = {
 
 // Flags selecting which Chrome debug session a command drives. Set both to run a
 // second signed-in account in parallel (e.g. Brave on 9222 + Chrome on 9223).
+// --browser picks bridge-profile (default), my-chrome, or my-edge.
 export type BrowserTargetOptions = {
   readonly debugPort?: string;
   readonly profile?: string;
+  readonly browser?: string;
 };
 
 export type AskOptions = CliOptions &
@@ -57,6 +59,21 @@ export type ChromeStartOptions = BrowserTargetOptions & {
 
 export type BrowserStatusOptions = {
   readonly json?: boolean;
+  readonly browser?: string;
+};
+
+export type DashboardOptions = {
+  readonly repo?: string;
+  readonly port?: string;
+  readonly browser?: string;
+  readonly serveOnly?: boolean;
+  readonly open?: boolean;
+};
+
+export type DaemonOptions = {
+  readonly repo?: string;
+  readonly browser?: string;
+  readonly json?: boolean;
 };
 
 export type CacheCmdOptions = {
@@ -79,6 +96,7 @@ export type ChatCmdOptions = CliOptions &
     readonly json?: boolean;
     readonly orphans?: boolean;
     readonly project?: string;
+    readonly title?: string;
     readonly id?: readonly string[];
     readonly limit?: string;
     readonly open?: boolean;
@@ -108,10 +126,11 @@ export type TaskCmdOptions = CliOptions &
     readonly at?: string;
   };
 
-export type ChatgptCmdOptions = CliOptions & {
-  readonly json?: boolean;
-  readonly allTabs?: boolean;
-};
+export type ChatgptCmdOptions = CliOptions &
+  BrowserTargetOptions & {
+    readonly json?: boolean;
+    readonly allTabs?: boolean;
+  };
 
 export type DesignCmdOptions = CliOptions &
   BrowserTargetOptions & {

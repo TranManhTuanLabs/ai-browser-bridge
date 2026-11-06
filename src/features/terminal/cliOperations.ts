@@ -17,17 +17,25 @@ import {
   fanoutFailed,
   startEngine,
 } from "@/features/bridge";
-import type { BrowserStatus, CacheInventory, PruneCacheResult } from "@/features/browser";
+import type {
+  BrowserChoice,
+  BrowserStatus,
+  CacheInventory,
+  PruneCacheResult,
+} from "@/features/browser";
 import {
   BRIDGE_DEBUG_PORT,
   BrowserSession,
   bridgeChromeProfileRoot,
+  configuredBrowserChoice,
   inventoryChromeCache,
   pruneChromeCache,
   readBrowserStatus,
   terminateChromeOnDebugPort,
 } from "@/features/browser";
 import type { ConversationSearchResult } from "@/features/conversationCatalog";
+import { installDaemon, readDaemonStatus, uninstallDaemon } from "@/features/daemon";
+import { DASHBOARD_PORT, serveDashboard } from "@/features/dashboard";
 import type {
   Attachment,
   CommandContext,
@@ -41,7 +49,7 @@ import {
   normalizePermissionMode,
   PERMISSION_MODES,
 } from "@/features/domain";
-import type { ArchiveChatOutcome, MoveChatOutcome } from "@/features/providers";
+import type { ArchiveChatOutcome, MoveChatOutcome, RenamedChat } from "@/features/providers";
 import {
   acknowledgeChatGptHistoryRateLimit,
   addClipToPrompt,
@@ -69,13 +77,17 @@ import {
   listTasks,
   loadManifest,
   moveChatToProject,
+  projectIdNamed,
   providerFor,
   providerIdForUrl,
   providerIdFrom,
   providerIdsFrom,
   readAllChatGptTabRenderStates,
   readChatGptRenderState,
+  readProjectIds,
+  registerConversationImages,
   removeIngredient,
+  renameChat,
   renameClip,
   renameFlowProject,
   renameProject,
@@ -147,6 +159,8 @@ import type {
   ChatOrganizationOptions,
   ChromeStartOptions,
   CliOptions,
+  DaemonOptions,
+  DashboardOptions,
   DownloadCmdOptions,
   DownloadResult,
   FlowCmdOptions,
@@ -305,7 +319,7 @@ const sessionTunnelLabel = (tunnelUrl: string | null | undefined): string => {
   return tunnelUrl;
 };
 
-export const formatBridgeStatus = (ctx: CommandContext): string => {
+const formatBridgeStatus = (ctx: CommandContext): string => {
   const provider = providerIdFrom(ctx.config.provider);
   return [
     `Provider: ${provider}`,
@@ -360,9 +374,11 @@ const statusConnectorLabel = (ctx: CommandContext): string => {
 const formatBrowserDebugStatus = (status: BrowserStatus): string => {
   return [
     `State: ${status.state}`,
+    `Browser: ${status.browserLabel} (${status.browserChoice})`,
     `Chrome running: ${status.chromeRunning ? "yes" : "no"}`,
     `Debug port: ${status.debugPortListening ? "ready" : "closed"} (${status.port})`,
     `Can attach: ${status.canAttach ? "yes" : "no"}`,
+    ...(status.allowRequired ? ["Allow: click Allow in the browser on every new connection"] : []),
     `Profile root: ${browserProfileRootLabel(status)}`,
     `Message: ${status.message}`,
   ].join("\n");
@@ -401,7 +417,7 @@ const formatCachePruneResult = (result: PruneCacheResult): string => {
   ].join("\n");
 };
 
-export const formatMcpDiagnostics = (ctx: CommandContext): string => {
+const formatMcpDiagnostics = (ctx: CommandContext): string => {
   const toolCallCount = statusToolCallCount(ctx);
   return [
     "MCP bridge diagnostics:",
@@ -425,7 +441,7 @@ const mcpToolCallStatusLabel = (toolCallCount: number): string => {
   return "No MCP tool calls observed yet; the current ChatGPT chat may not have the connector enabled.";
 };
 
-export const formatConnectorSetupResult = (result: ConnectorSetupResult): string => {
+const formatConnectorSetupResult = (result: ConnectorSetupResult): string => {
   return [
     "",
     "Connector setup result:",
@@ -1620,7 +1636,7 @@ const BUILTIN_COMMANDS: CommandDef[] = [
 const commands = new Map<string, CommandDef>();
 const canonicalNames = new Set<string>();
 
-export const registerCommand = (cmd: CommandDef): void => {
+const registerCommand = (cmd: CommandDef): void => {
   commands.set(cmd.name, cmd);
   canonicalNames.add(cmd.name);
   const aliases = cmd.aliases === undefined ? [] : cmd.aliases;
@@ -1640,7 +1656,7 @@ export const registeredCommands = (): CommandDef[] => {
   return listed;
 };
 
-export const parseCommand = (input: string): { name: string; args: string } | null => {
+const parseCommand = (input: string): { name: string; args: string } | null => {
   const parsed = parseCommandInput(input);
   if (!parsed || !commands.has(parsed.name)) return null;
   return parsed;
@@ -1695,10 +1711,21 @@ export const runSessions = async (): Promise<void> => {
 };
 
 export const runBrowserStatus = async (options: BrowserStatusOptions = {}): Promise<void> => {
-  const status = await readBrowserStatus();
+  const status = await readBrowserStatus({
+    browserChoice: browserChoiceFromOption(options.browser),
+  });
   if (options.json) process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
   else process.stdout.write(`${formatBrowserDebugStatus(status)}\n`);
   process.exit(0);
+};
+
+// --browser wins over AI_BROWSER_BRIDGE_BROWSER; an invalid value fails fast
+// with the valid choices instead of silently driving the wrong browser.
+// Commander also merges the global --no-browser flag into subcommand options
+// as browser: false, so only a string value counts as a choice.
+const browserChoiceFromOption = (value: unknown): BrowserChoice => {
+  if (typeof value !== "string") return configuredBrowserChoice();
+  return configuredBrowserChoice({ AI_BROWSER_BRIDGE_BROWSER: value });
 };
 
 const cacheProfileRoot = (options: CacheCmdOptions): string => {
@@ -2179,6 +2206,7 @@ const startAskEngine = async (input: StartAskEngineInput) => {
     persist: withTools,
     debugPort: debugPortFromOption(input.options.debugPort),
     profileRoot: profileRootFromOption(input.options.profile),
+    browserChoice: browserChoiceFromOption(input.options.browser),
   });
 };
 
@@ -2370,6 +2398,11 @@ const downloadAfterExtract = async (input: {
     page: input.page,
   });
   await extractAllMessages(input.page, { conversationId: input.conversationId, manifestRoot });
+  await registerConversationImages({
+    page: input.page,
+    conversationId: input.conversationId,
+    manifestRoot,
+  });
   if (input.options.scan) {
     const manifest = await loadManifest(input.conversationId, { manifestRoot });
     process.stderr.write(
@@ -2394,6 +2427,7 @@ const startDownloadEngine = async (options: DownloadCmdOptions) => {
     persist: false,
     debugPort: debugPortFromOption(options.debugPort),
     profileRoot: profileRootFromOption(options.profile),
+    browserChoice: browserChoiceFromOption(options.browser),
   });
 };
 
@@ -2425,6 +2459,7 @@ const startWorkspaceSession = async (options: CliOptions & BrowserTargetOptions)
     withTools: false,
     debugPort: debugPortFromOption(options.debugPort),
     profileRoot: profileRootFromOption(options.profile),
+    browserChoice: browserChoiceFromOption(options.browser),
   });
   return { engine, page: requireBrowserPage(engine) };
 };
@@ -2587,12 +2622,43 @@ export const runChatMove = async (chat: string, options: ChatCmdOptions): Promis
   }
   const { engine, page } = await startWorkspaceSession(options);
   const outcomes: MoveChatOutcome[] = [];
-  for (const target of targets) {
-    outcomes.push(await moveChatToProject(page, { chat: target, project }));
+  try {
+    const projectIdByName = await readProjectIds(page, [project]);
+    const projectId = projectIdNamed(projectIdByName, project);
+    for (const target of targets) {
+      outcomes.push(await moveChatToProject(page, { chat: target, project, projectId }));
+    }
+  } finally {
+    await engine.shutdown({ closeBrowser: false });
   }
-  await engine.shutdown({ closeBrowser: false });
   writeMoveOutcomes(outcomes, options);
   process.exit(outcomes.every((outcome) => outcome.moved || outcome.alreadyFiled) ? 0 : 1);
+};
+
+const writeRenamedChat = (renamedChat: RenamedChat, options: ChatCmdOptions): void => {
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(renamedChat)}\n`);
+    return;
+  }
+  process.stdout.write(`Renamed ${renamedChat.id} -> "${renamedChat.title}"\n`);
+};
+
+export const runChatRename = async (chat: string, options: ChatCmdOptions): Promise<void> => {
+  assertChatgptWorkspace(options);
+  const [target, ...otherTargets] = chatTargetsFrom(chat, options);
+  const title = options.title?.trim() ?? "";
+  const isUsageValid = target !== undefined && otherTargets.length === 0 && title !== "";
+  if (!isUsageValid) {
+    return fail('Usage: bridge chat rename <idOrTitle> --title "<new title>"  (or --id <id>)');
+  }
+  const { engine, page } = await startWorkspaceSession(options);
+  try {
+    const renamedChat = await renameChat(page, { chat: target, title });
+    writeRenamedChat(renamedChat, options);
+  } finally {
+    await engine.shutdown({ closeBrowser: false });
+  }
+  process.exit(0);
 };
 
 const DEFAULT_ORGANIZATION_INTERVAL_SECONDS = 60;
@@ -2939,6 +3005,23 @@ export const runChatOrganizeResume = async (options: ChatOrganizationOptions): P
   return runChatOrganize({ ...options, plan, restart: false, dryRun: false });
 };
 
+const listPlannedProjectNames = (tasks: readonly { readonly project: string }[]): string[] => {
+  return tasks.map((task) => task.project);
+};
+
+// Every planned Project must exist before the first move. Throws with the missing names.
+const checkPlannedProjectsExist = async (
+  options: ChatOrganizationOptions,
+  projectNames: string[],
+): Promise<void> => {
+  const { engine, page } = await startWorkspaceSession(options);
+  try {
+    await readProjectIds(page, projectNames);
+  } finally {
+    await engine.shutdown({ closeBrowser: false });
+  }
+};
+
 export const runChatOrganize = async (options: ChatOrganizationOptions): Promise<void> => {
   assertChatgptWorkspace(options);
   const plan = options.plan;
@@ -2984,6 +3067,7 @@ export const runChatOrganize = async (options: ChatOrganizationOptions): Promise
   const repoRoot = repositoryRoot(options.repo);
   const queuePath = chatOrganizationQueuePath(repoRoot, tasks);
   if (options.dryRun) {
+    await checkPlannedProjectsExist(options, listPlannedProjectNames(tasks));
     writeChatOrganizationDryRun({
       tasks,
       queuePath,
@@ -3068,6 +3152,7 @@ export const runChatOrganize = async (options: ChatOrganizationOptions): Promise
   let workspaceWasShutdown = false;
   let paused = false;
   try {
+    const projectIdByName = await readProjectIds(workspace.page, listPlannedProjectNames(tasks));
     let consecutiveRateLimitCooldowns = 0;
     let halted = false;
     while (!paused && !halted) {
@@ -3126,12 +3211,15 @@ export const runChatOrganize = async (options: ChatOrganizationOptions): Promise
           moveOutcome = await moveChatToProject(workspace.page, {
             chat: item.conversation,
             project: item.project,
+            projectId: projectIdNamed(projectIdByName, item.project),
           });
         } catch (error) {
           thrownReason = error instanceof Error ? error.message : String(error);
         }
         const sessionClosed = chatOrganizationSessionWasClosed(thrownReason);
-        const rateLimited = await acknowledgeChatGptHistoryRateLimit(workspace.page);
+        const isRateLimitedOnPage = await acknowledgeChatGptHistoryRateLimit(workspace.page);
+        const isRateLimitedByMove = moveOutcome?.rateLimited === true;
+        const rateLimited = isRateLimitedOnPage || isRateLimitedByMove;
         queue = await recordChatOrganizationAttempt({
           queue,
           queuePath,
@@ -3329,22 +3417,37 @@ const scheduledTaskCadence = (options: TaskCmdOptions): string | undefined => {
 };
 
 export const runChromeStart = async (options: ChromeStartOptions = {}): Promise<void> => {
-  await launchChromeBrowser(options);
-  writeChromeStartInstructions(providerFor(providerIdFrom(options.provider)).displayName);
+  const browserChoice = browserChoiceFromOption(options.browser);
+  await launchChromeBrowser(options, browserChoice);
+  writeChromeStartInstructions(
+    providerFor(providerIdFrom(options.provider)).displayName,
+    browserChoice,
+  );
   process.exit(0);
 };
 
-const launchChromeBrowser = async (options: ChromeStartOptions): Promise<BrowserSession> => {
+const launchChromeBrowser = async (
+  options: ChromeStartOptions,
+  browserChoice: BrowserChoice = browserChoiceFromOption(options.browser),
+): Promise<BrowserSession> => {
   const provider = providerIdFrom(options.provider);
   const browser = new BrowserSession(provider, {
     debugPort: debugPortFromOption(options.debugPort),
     profileRoot: profileRootFromOption(options.profile),
+    browserChoice,
   });
   await browser.launch();
   return browser;
 };
 
-const writeChromeStartInstructions = (displayName: string): void => {
+const writeChromeStartInstructions = (displayName: string, browserChoice: BrowserChoice): void => {
+  if (browserChoice !== "bridge-profile") {
+    process.stderr.write(
+      `Attached to your browser for ${displayName} in a new bridge tab.\n` +
+        `Your browser stays yours: close the bridge tab when you are done, and click Allow on every new connection.\n`,
+    );
+    return;
+  }
   process.stderr.write(
     `Chrome is open for ${displayName} with the bridge debug port.
 This uses the shared bridge Chrome profile, so sign in once in this window and every repo can reuse it.
@@ -3353,11 +3456,90 @@ Leave this Chrome window open; \`bridge ask\` will reconnect to it.
   );
 };
 
-export const runStop = async (): Promise<void> => {
+export const runStop = async (options: BrowserStatusOptions = {}): Promise<void> => {
+  const browserChoice = browserChoiceFromOption(options.browser);
+  if (browserChoice !== "bridge-profile") {
+    // A stop must never kill the user's own browser. There is no bridge-owned
+    // process to stop; the bridge tab closes when its session ends.
+    process.stderr.write(
+      "Disconnected. Your browser was left running — close the bridge tab in it when you are done.\n",
+    );
+    process.exit(0);
+  }
   const killed = await terminateChromeOnDebugPort(BRIDGE_DEBUG_PORT);
   process.stderr.write(
     killed ? "Closed the bridge browser.\n" : "No bridge browser was running.\n",
   );
+  process.exit(0);
+};
+
+export const runDashboard = async (options: DashboardOptions = {}): Promise<void> => {
+  const port = options.port === undefined ? DASHBOARD_PORT : Number(options.port);
+  let resolveStop: () => void = () => undefined;
+  const stopped = new Promise<void>((resolveStopped) => {
+    resolveStop = resolveStopped;
+  });
+  const server = await serveDashboard({
+    repoPath: options.repo ? resolve(options.repo) : undefined,
+    port: Number.isFinite(port) && port > 0 ? port : DASHBOARD_PORT,
+    browserChoice: browserChoiceFromOption(options.browser),
+    openBrowser: options.open !== false && options.serveOnly !== true,
+    onClose: () => resolveStop(),
+  });
+  process.stdout.write(
+    `Dashboard: ${server.url}\nLocal only — it binds 127.0.0.1 and never polls the browser.\nPress Ctrl+C to stop.\n`,
+  );
+  await Promise.race([
+    stopped,
+    new Promise<void>((resolveSignal) => {
+      const stop = (): void => {
+        void server.close().then(() => resolveSignal());
+      };
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    }),
+  ]);
+  process.exit(0);
+};
+
+const bridgeBinPath = (): string => {
+  const bin = process.argv[1];
+  if (bin === undefined || bin === "") {
+    throw new Error("Cannot install the daemon: the bridge binary path is unknown.");
+  }
+  return bin;
+};
+
+export const runDaemonInstall = async (options: DaemonOptions = {}): Promise<void> => {
+  const status = await installDaemon({
+    bridgeBin: bridgeBinPath(),
+    repoPath: options.repo ? resolve(options.repo) : process.cwd(),
+    browserChoice: browserChoiceFromOption(options.browser),
+  });
+  if (options.json) process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+  else {
+    process.stdout.write(
+      `Daemon installed: ${status.label}\nPlist: ${status.plistPath}\nLog: ${status.logPath}\nRunning: ${status.running ? "yes" : "no"}\n`,
+    );
+  }
+  process.exit(0);
+};
+
+export const runDaemonStatus = async (options: DaemonOptions = {}): Promise<void> => {
+  const status = await readDaemonStatus();
+  if (options.json) process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+  else {
+    process.stdout.write(
+      `Daemon: ${status.label}\nInstalled: ${status.installed ? "yes" : "no"}\nRunning: ${status.running ? "yes" : "no"}\nPlist: ${status.plistPath}\nLog: ${status.logPath}\n`,
+    );
+  }
+  process.exit(0);
+};
+
+export const runDaemonUninstall = async (options: DaemonOptions = {}): Promise<void> => {
+  const status = await uninstallDaemon();
+  if (options.json) process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+  else process.stdout.write(`Daemon uninstalled: ${status.label}\n`);
   process.exit(0);
 };
 
@@ -3517,6 +3699,7 @@ const startFlowSession = async (options: FlowCmdOptions) => {
     withTools: false,
     debugPort: debugPortFromOption(options.debugPort),
     profileRoot: profileRootFromOption(options.profile),
+    browserChoice: browserChoiceFromOption(options.browser),
   });
   return { engine, page: requireBrowserPage(engine) };
 };
@@ -3534,6 +3717,7 @@ const startDesignSession = async (options: CliOptions & BrowserTargetOptions) =>
     persist: false,
     debugPort: debugPortFromOption(options.debugPort),
     profileRoot: profileRootFromOption(options.profile),
+    browserChoice: browserChoiceFromOption(options.browser),
   });
   const browser = engine.browser;
   if (!browser) {

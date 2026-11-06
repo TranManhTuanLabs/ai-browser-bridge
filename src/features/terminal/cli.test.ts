@@ -37,6 +37,35 @@ describe("runCli", () => {
     expect(stderrWrites).toHaveLength(1);
     expect(stderrWrites[0]).toMatch(/^Unknown provider "foo"\. Valid providers: chatgpt, .+\n$/);
   });
+
+  it("offers --debug-port and --profile on chatgpt inspect", async () => {
+    const stdoutWrites: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdoutWrites.push(String(chunk));
+      return true;
+    });
+    fakeExit();
+    const run = runCli(["node", "bridge", "chatgpt", "inspect", "--help"]);
+    await expect(run).rejects.toBeInstanceOf(ExitSignal);
+    const helpText = stdoutWrites.join("");
+    expect(helpText).toContain("--debug-port <number>");
+    expect(helpText).toContain("--profile <path>");
+  });
+
+  it("accepts --browser my-edge on status without tripping over --no-browser", async () => {
+    const stdoutWrites: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdoutWrites.push(String(chunk));
+      return true;
+    });
+    fakeExit();
+    const run = runCli(["node", "bridge", "status", "--browser", "my-edge", "--json"]);
+    // runCli catches the mocked exit(0) as an error and re-exits 1; the
+    // JSON on stdout is the assertion that matters here.
+    await expect(run).rejects.toMatchObject({ code: 1 });
+    const status = JSON.parse(stdoutWrites.join("")) as { browserChoice: string };
+    expect(status.browserChoice).toBe("my-edge");
+  });
 });
 
 describe("cliFailureMessage", () => {

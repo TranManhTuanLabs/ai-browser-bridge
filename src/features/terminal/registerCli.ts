@@ -13,8 +13,13 @@ import {
   runChatOrganizePause,
   runChatOrganizeResume,
   runChatOrganizeStatus,
+  runChatRename,
   runChatSearch,
   runChromeStart,
+  runDaemonInstall,
+  runDaemonStatus,
+  runDaemonUninstall,
+  runDashboard,
   runDownload,
   runFlowClips,
   runFlowDelete,
@@ -49,6 +54,8 @@ import type {
   ChatOrganizationOptions,
   ChromeStartOptions,
   CliOptions,
+  DaemonOptions,
+  DashboardOptions,
   DesignCmdOptions,
   DownloadCmdOptions,
   FlowCmdOptions,
@@ -83,6 +90,8 @@ import { subcommandOpts } from "./subcommandOpts.ts";
 
 // Derived from PROVIDER_IDS so help text cannot go stale.
 const PROVIDER_OPTION = `Browser provider: ${PROVIDER_IDS.join(", ")} (default: ${DEFAULT_PROVIDER})`;
+const BROWSER_OPTION =
+  "Browser: bridge-profile, my-chrome, or my-edge (default: bridge-profile; or AI_BROWSER_BRIDGE_BROWSER)";
 
 export const registerCliCommands = (program: Command): void => {
   program
@@ -102,6 +111,8 @@ export const registerCliCommands = (program: Command): void => {
       await runInteractiveCli(command.opts() as CliOptions & { browser?: boolean });
     });
   registerHeadlessCommands(program);
+  registerDashboardCommands(program);
+  registerDaemonCommands(program);
   registerWorkspaceCommands(program);
   registerChatgptCommands(program);
   registerFlowCommands(program);
@@ -118,9 +129,17 @@ const registerChatgptCommands = (program: Command): void => {
     .option("-r, --repo <path>", "Target repository for bridge state")
     .option("-p, --port <number>", "MCP server port")
     .option("--all-tabs", "Report every ChatGPT tab in the browser instead of just the active one")
+    .option(
+      "--debug-port <number>",
+      "Chrome remote-debugging port to drive (parallel accounts; default 9222)",
+    )
+    .option(
+      "--profile <path>",
+      "Chrome user-data-dir to drive (parallel accounts; default shared bridge profile)",
+    )
     .option("--json", "Emit JSON instead of human-readable lines")
     .action((_options: ChatgptCmdOptions, command: Command) =>
-      runChatgptInspect(command.optsWithGlobals() as ChatgptCmdOptions),
+      runChatgptInspect(subcommandOpts<ChatgptCmdOptions>(command)),
     );
 };
 
@@ -171,6 +190,7 @@ const registerHeadlessCommands = (program: Command): void => {
       "--profile <path>",
       "Chrome user-data-dir to drive (parallel accounts; default shared bridge profile)",
     )
+    .option("--browser <name>", BROWSER_OPTION)
     .action((promptParts: string[], _options: AskOptions, command: Command) =>
       runAsk(promptParts.join(" "), subcommandOpts(command)),
     );
@@ -204,15 +224,19 @@ const registerHeadlessCommands = (program: Command): void => {
     .command("status")
     .description("Show browser/debug-port status")
     .option("--json", "Emit JSON instead of human-readable lines")
+    .option("--browser <name>", BROWSER_OPTION)
     .action((_options: BrowserStatusOptions, command: Command) =>
-      runBrowserStatus(command.optsWithGlobals() as BrowserStatusOptions),
+      runBrowserStatus(subcommandOpts<BrowserStatusOptions>(command)),
     );
   registerChromeCommands(program);
   registerCacheCommands(program);
   program
     .command("stop")
-    .description("Close the warm bridge browser")
-    .action(() => runStop());
+    .description("Close the warm bridge browser (your own browser is never killed)")
+    .option("--browser <name>", BROWSER_OPTION)
+    .action((_options: BrowserStatusOptions, command: Command) =>
+      runStop(subcommandOpts<BrowserStatusOptions>(command)),
+    );
   program
     .command("serve")
     .description("Serve the outbound MCP `ask` tool over stdio so other agents can drive web chats")
@@ -239,20 +263,68 @@ const registerChromeCommands = (program: Command): void => {
       "--profile <path>",
       "Chrome user-data-dir to spawn (parallel accounts; default shared bridge profile)",
     )
+    .option("--browser <name>", BROWSER_OPTION)
     .action((_options: ChromeStartOptions, command: Command) =>
-      runChromeStart(command.optsWithGlobals() as ChromeStartOptions),
+      runChromeStart(subcommandOpts<ChromeStartOptions>(command)),
     );
   chrome
     .command("status")
     .description("Show Chrome/debug-port status")
     .option("--json", "Emit JSON instead of human-readable lines")
+    .option("--browser <name>", BROWSER_OPTION)
     .action((_options: BrowserStatusOptions, command: Command) =>
-      runBrowserStatus(command.optsWithGlobals() as BrowserStatusOptions),
+      runBrowserStatus(subcommandOpts<BrowserStatusOptions>(command)),
     );
   chrome
     .command("stop")
-    .description("Close the Chrome debug-port process")
-    .action(() => runStop());
+    .description("Close the Chrome debug-port process (your own browser is never killed)")
+    .option("--browser <name>", BROWSER_OPTION)
+    .action((_options: BrowserStatusOptions, command: Command) =>
+      runStop(subcommandOpts<BrowserStatusOptions>(command)),
+    );
+};
+
+const registerDashboardCommands = (program: Command): void => {
+  program
+    .command("dashboard")
+    .description("Serve the local-only dashboard on http://127.0.0.1:8766")
+    .option("-r, --repo <path>", "Target repository for bridge state")
+    .option("--port <number>", "Dashboard port (default: 8766)")
+    .option("--browser <name>", BROWSER_OPTION)
+    .option("--serve-only", "Do not open the dashboard in a browser (used by the daemon)")
+    .option("--no-open", "Do not open the dashboard in a browser")
+    .action((_options: DashboardOptions, command: Command) =>
+      runDashboard(subcommandOpts<DashboardOptions>(command)),
+    );
+};
+
+const registerDaemonCommands = (program: Command): void => {
+  const daemon = program
+    .command("daemon")
+    .description("Run the bridge as a macOS launchd agent so closing the terminal keeps it up");
+  daemon
+    .command("install")
+    .description("Install and start the launchd agent (macOS only)")
+    .option("-r, --repo <path>", "Target repository for bridge state")
+    .option("--browser <name>", BROWSER_OPTION)
+    .option("--json", "Emit JSON instead of human-readable lines")
+    .action((_options: DaemonOptions, command: Command) =>
+      runDaemonInstall(subcommandOpts<DaemonOptions>(command)),
+    );
+  daemon
+    .command("status")
+    .description("Show whether the launchd agent is installed and running")
+    .option("--json", "Emit JSON instead of human-readable lines")
+    .action((_options: DaemonOptions, command: Command) =>
+      runDaemonStatus(subcommandOpts<DaemonOptions>(command)),
+    );
+  daemon
+    .command("uninstall")
+    .description("Stop and remove the launchd agent")
+    .option("--json", "Emit JSON instead of human-readable lines")
+    .action((_options: DaemonOptions, command: Command) =>
+      runDaemonUninstall(subcommandOpts<DaemonOptions>(command)),
+    );
 };
 
 const registerCacheCommands = (program: Command): void => {
@@ -263,7 +335,7 @@ const registerCacheCommands = (program: Command): void => {
     .option("--profile <path>", "Chrome profile root (default: shared bridge profile)")
     .option("--json", "Emit JSON instead of human-readable lines")
     .action((_options: CacheCmdOptions, command: Command) =>
-      runCacheList(command.optsWithGlobals() as CacheCmdOptions),
+      runCacheList(subcommandOpts<CacheCmdOptions>(command)),
     );
   cache
     .command("prune")
@@ -273,7 +345,7 @@ const registerCacheCommands = (program: Command): void => {
     .option("-y, --yes", "Confirm deletion")
     .option("--json", "Emit JSON instead of human-readable lines")
     .action((_options: CacheCmdOptions, command: Command) =>
-      runCachePrune(command.optsWithGlobals() as CacheCmdOptions),
+      runCachePrune(subcommandOpts<CacheCmdOptions>(command)),
     );
 };
 
@@ -282,6 +354,7 @@ const withWorkspaceFlags = (command: Command): Command => {
     .option("-r, --repo <path>", "Target repository for bridge state")
     .option("-p, --port <number>", "MCP server port")
     .option("--provider <name>", PROVIDER_OPTION)
+    .option("--browser <name>", BROWSER_OPTION)
     .option(
       "--debug-port <number>",
       "Chrome remote-debugging port to drive (parallel accounts; default 9222)",
@@ -316,55 +389,65 @@ const registerWorkspaceCommands = (program: Command): void => {
   withWorkspaceFlags(project.command("list"))
     .description("List ChatGPT Projects")
     .action((_options: ProjectCmdOptions, command: Command) =>
-      runProjectList(command.optsWithGlobals() as ProjectCmdOptions),
+      runProjectList(subcommandOpts<ProjectCmdOptions>(command)),
     );
   withWorkspaceFlags(project.command("create <name...>"))
     .description("Create a ChatGPT Project")
     .option("--instructions <text>", "Optional project instructions")
     .action((nameParts: string[], _options: ProjectCmdOptions, command: Command) =>
-      runProjectCreate(nameParts.join(" "), command.optsWithGlobals() as ProjectCmdOptions),
+      runProjectCreate(nameParts.join(" "), subcommandOpts<ProjectCmdOptions>(command)),
     );
   withWorkspaceFlags(project.command("rename <name...>"))
     .description("Rename a ChatGPT Project")
     .option("--to <newName>", "New project name")
     .action((nameParts: string[], _options: ProjectCmdOptions, command: Command) =>
-      runProjectRename(nameParts.join(" "), command.optsWithGlobals() as ProjectCmdOptions),
+      runProjectRename(nameParts.join(" "), subcommandOpts<ProjectCmdOptions>(command)),
     );
   withWorkspaceFlags(project.command("delete <name...>"))
     .description("Delete a ChatGPT Project (permanently deletes its chats)")
     .option("-y, --yes", "Confirm deletion")
     .action((nameParts: string[], _options: ProjectCmdOptions, command: Command) =>
-      runProjectDelete(nameParts.join(" "), command.optsWithGlobals() as ProjectCmdOptions),
+      runProjectDelete(nameParts.join(" "), subcommandOpts<ProjectCmdOptions>(command)),
     );
 
   const chat = program
     .command("chat")
     .description("List or organize ChatGPT conversations (ChatGPT only)");
   withWorkspaceFlags(chat.command("list"))
-    .description("List sidebar (project-less) conversations")
-    .option("--orphans", "List only loose, project-less conversations")
+    .description("List the conversations shown in the ChatGPT sidebar (may include Project chats)")
+    .option(
+      "--orphans",
+      "List every loose conversation outside all Projects, read from the full ChatGPT history",
+    )
     .action((_options: ChatCmdOptions, command: Command) =>
-      runChatList(command.optsWithGlobals() as ChatCmdOptions),
+      runChatList(subcommandOpts<ChatCmdOptions>(command)),
     );
   withWorkspaceFlags(chat.command("search <query...>"))
     .description("Search ChatGPT conversation history")
     .option("--limit <count>", "Maximum results (default: 20)")
     .option("--open", "Open the best match in the browser")
     .action((queryParts: string[], _options: ChatCmdOptions, command: Command) =>
-      runChatSearch(queryParts.join(" "), command.optsWithGlobals() as ChatCmdOptions),
+      runChatSearch(queryParts.join(" "), subcommandOpts<ChatCmdOptions>(command)),
     );
   withWorkspaceFlags(chat.command("move [idOrTitle...]"))
     .description("Move one or more conversations into a Project")
     .option("--project <name>", "Destination project name")
     .option("--id <id...>", "Move several conversations by id in one session")
     .action((chatParts: string[], _options: ChatCmdOptions, command: Command) =>
-      runChatMove(chatParts.join(" "), command.optsWithGlobals() as ChatCmdOptions),
+      runChatMove(chatParts.join(" "), subcommandOpts<ChatCmdOptions>(command)),
+    );
+  withWorkspaceFlags(chat.command("rename [idOrTitle...]"))
+    .description("Rename one ChatGPT conversation")
+    .option("--title <title>", "New conversation title")
+    .option("--id <id...>", "Rename the conversation with this id (one id only)")
+    .action((chatParts: string[], _options: ChatCmdOptions, command: Command) =>
+      runChatRename(chatParts.join(" "), subcommandOpts<ChatCmdOptions>(command)),
     );
   withWorkspaceFlags(chat.command("archive [idOrTitle...]"))
     .description("Archive one or more conversations (reversible — hides from the sidebar)")
     .option("--id <id...>", "Archive several conversations by id in one session")
     .action((chatParts: string[], _options: ChatCmdOptions, command: Command) =>
-      runChatArchive(chatParts.join(" "), command.optsWithGlobals() as ChatCmdOptions),
+      runChatArchive(chatParts.join(" "), subcommandOpts<ChatCmdOptions>(command)),
     );
   const organize = withOrganizationPacingFlags(withWorkspaceFlags(chat.command("organize")))
     .description("Run a resumable, rate-safe Conversation organization queue")
@@ -375,39 +458,39 @@ const registerWorkspaceCommands = (program: Command): void => {
     .option("--restart", "Restart this plan instead of resuming its persisted queue")
     .option("--dry-run", "Validate and show the queue without opening Chrome or writing state")
     .action((_options: ChatOrganizationOptions, command: Command) =>
-      runChatOrganize(command.optsWithGlobals() as ChatOrganizationOptions),
+      runChatOrganize(subcommandOpts<ChatOrganizationOptions>(command)),
     );
   withWorkspaceFlags(organize.command("status"))
     .description("Show the latest organization queue state and adaptive pace")
     .option("--queue <pathOrFingerprint>", "Select a queue instead of the latest one")
     .action((_options: ChatOrganizationOptions, command: Command) =>
-      runChatOrganizeStatus(command.optsWithGlobals() as ChatOrganizationOptions),
+      runChatOrganizeStatus(subcommandOpts<ChatOrganizationOptions>(command)),
     );
   withWorkspaceFlags(organize.command("pause"))
     .description("Pause the latest queue after its active UI operation")
     .option("--queue <pathOrFingerprint>", "Select a queue instead of the latest one")
     .action((_options: ChatOrganizationOptions, command: Command) =>
-      runChatOrganizePause(command.optsWithGlobals() as ChatOrganizationOptions),
+      runChatOrganizePause(subcommandOpts<ChatOrganizationOptions>(command)),
     );
   withOrganizationPacingFlags(withWorkspaceFlags(organize.command("resume")))
     .description("Resume the latest persisted organization queue")
     .option("--queue <pathOrFingerprint>", "Select a queue instead of the latest one")
     .action((_options: ChatOrganizationOptions, command: Command) =>
-      runChatOrganizeResume(command.optsWithGlobals() as ChatOrganizationOptions),
+      runChatOrganizeResume(subcommandOpts<ChatOrganizationOptions>(command)),
     );
 
   const task = program.command("task").description("List or schedule ChatGPT Tasks (ChatGPT only)");
   withWorkspaceFlags(task.command("list"))
     .description("List ChatGPT Scheduled tasks")
     .action((_options: TaskCmdOptions, command: Command) =>
-      runTaskList(command.optsWithGlobals() as TaskCmdOptions),
+      runTaskList(subcommandOpts<TaskCmdOptions>(command)),
     );
   withWorkspaceFlags(task.command("create <prompt...>"))
     .description("Schedule a task via natural language")
     .option("--every <spec>", "Recurring cadence (e.g. day, or weekday at 9am)")
     .option("--at <spec>", "One-off run time (e.g. tomorrow at 9am)")
     .action((promptParts: string[], _options: TaskCmdOptions, command: Command) =>
-      runTaskCreate(promptParts.join(" "), command.optsWithGlobals() as TaskCmdOptions),
+      runTaskCreate(promptParts.join(" "), subcommandOpts<TaskCmdOptions>(command)),
     );
 };
 
@@ -415,6 +498,7 @@ const withBrowserCommandFlags = (command: Command): Command => {
   return command
     .option("-r, --repo <path>", "Target repository for bridge state")
     .option("-p, --port <number>", "MCP server port")
+    .option("--browser <name>", BROWSER_OPTION)
     .option(
       "--debug-port <number>",
       "Chrome remote-debugging port to drive (parallel accounts; default 9222)",
@@ -433,19 +517,19 @@ const registerFlowCommands = (program: Command): void => {
   withBrowserCommandFlags(flow.command("clips"))
     .description("List clips in the current Flow project")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowClips(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowClips(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("projects"))
     .description("List Flow projects")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowProjects(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowProjects(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("download"))
     .description("Download clip mp4s (all, or --id <clipId...>)")
     .option("--id <clipId...>", "Specific clip id(s); omit to download every clip")
     .option("--out <dir>", "Output directory (default: <repo>/.bridge/downloads/flow)")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowDownload(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowDownload(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("generate"))
     .description("Generate a Veo clip from a Start keyframe + prompt (image-to-video)")
@@ -453,61 +537,61 @@ const registerFlowCommands = (program: Command): void => {
     .option("--prompt <text>", "Shot / motion prompt")
     .option("--out <dir>", "Download directory (default: <repo>/.bridge/downloads/flow)")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowGenerate(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowGenerate(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("delete"))
     .description("Move a clip to Flow Trash (recoverable)")
     .option("--id <clipId...>", "Clip id to trash")
     .option("-y, --yes", "Confirm the delete")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowDelete(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowDelete(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("rename"))
     .description("Rename a clip")
     .option("--id <clipId...>", "Clip id to rename")
     .option("--name <text>", "New clip name")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowRename(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowRename(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("extend"))
     .description("Add a clip to a scene (Flow extend)")
     .option("--id <clipId...>", "Clip id to extend")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowExtend(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowExtend(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("reuse"))
     .description("Add a clip back to the prompt as input")
     .option("--id <clipId...>", "Clip id to reuse")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowReuse(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowReuse(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("project-rename"))
     .description("Rename the current Flow project")
     .option("--name <text>", "New project name")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowProjectRename(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowProjectRename(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("project-delete"))
     .description("Delete the current Flow project (permanent)")
     .option("-y, --yes", "Confirm the delete")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowProjectDelete(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowProjectDelete(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("ingredients"))
     .description("List reference images attached to the current prompt")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowIngredients(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowIngredients(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("ingredient-remove"))
     .description("Detach one prompt ingredient")
     .option("--id <mediaId...>", "Ingredient media id to remove")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowIngredientRemove(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowIngredientRemove(subcommandOpts<FlowCmdOptions>(command)),
     );
   withBrowserCommandFlags(flow.command("ingredient-clear"))
     .description("Detach every ingredient from the current prompt")
     .action((_options: FlowCmdOptions, command: Command) =>
-      runFlowIngredientClear(command.optsWithGlobals() as FlowCmdOptions),
+      runFlowIngredientClear(subcommandOpts<FlowCmdOptions>(command)),
     );
 };
 
@@ -526,7 +610,7 @@ const designCommand = (parent: Command, name: string, description: string): Comm
 };
 
 const designOptions = (command: Command): DesignCmdOptions =>
-  command.optsWithGlobals() as DesignCmdOptions;
+  subcommandOpts<DesignCmdOptions>(command);
 
 const registerDesignCommands = (program: Command): void => {
   const design = program

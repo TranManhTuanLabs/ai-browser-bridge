@@ -11,7 +11,7 @@ import type {
 import { findModelProfile } from "@/features/domain";
 import { type BrowserProvider, isSameChatGptConversation, providerFor } from "@/features/providers";
 
-export type SendPromptOptions = {
+type SendPromptOptions = {
   timeoutMs?: number;
 };
 
@@ -44,7 +44,7 @@ export type OrchestratorEvent =
   | { type: "model_changed"; model: string; contextLimit: number }
   | { type: "reset" };
 
-export type OrchestratorListener = (event: OrchestratorEvent) => void;
+type OrchestratorListener = (event: OrchestratorEvent) => void;
 
 const requirePage = (page: Page | null, emit: (event: OrchestratorEvent) => void): Page | null => {
   if (page !== null) return page;
@@ -419,6 +419,8 @@ export class Orchestrator {
   }
 
   async listConversations(options?: { readonly orphans?: boolean }) {
+    const isOrphanScanWithoutPage = this.page === null && options?.orphans === true;
+    if (isOrphanScanWithoutPage) throw new Error("No ChatGPT page is open to read loose chats.");
     if (this.page === null) return [];
     return this.provider.readSidebarConversations(this.page, options);
   }
